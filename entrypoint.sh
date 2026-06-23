@@ -63,15 +63,23 @@ sed -i "s/PROXY_READ_TIMEOUT_PLACEHOLDER/$PROXY_READ_TIMEOUT/g" /etc/nginx/nginx
 sed -i "s/CLIENT_MAX_BODY_SIZE_PLACEHOLDER/$CLIENT_MAX_BODY_SIZE/g" /etc/nginx/nginx.conf
 
 # Determine authentication mode
-# OIDC takes precedence when enabled — mixing with hash/credentials isn't supported yet.
+# OIDC handles interactive (human) logins. A static AUTH_HASH MAY be set alongside
+# OIDC for non-interactive API / non-human access: the auth service honours a valid
+# ?hash= in any mode, so API clients bypass the OIDC redirect while humans still get
+# the SSO flow. (USER/PASSWORD credential mode does NOT compose with OIDC.)
 # OIDC is considered enabled iff OIDC_REGISTRAR_URL is set (points at the registrar
 # on the pcs network, typically http://auth-registrar:9092).
+# Machine/API auth is enabled by a static AUTH_HASH and/or an external credential
+# validator (CREDENTIAL_VALIDATE_URL — e.g. the CasaOS bridge, for real per-user
+# API identity). Either one composes with the human methods exactly like a hash.
+if [ -n "$AUTH_HASH" ] || [ -n "$CREDENTIAL_VALIDATE_URL" ]; then MACHINE_AUTH=1; else MACHINE_AUTH=0; fi
+
 AUTH_MODE="none"
 if [ -n "$OIDC_REGISTRAR_URL" ]; then
     AUTH_MODE="oidc_only"
-elif [ -n "$AUTH_HASH" ] && [ -n "$USER" ] && [ -n "$PASSWORD" ]; then
+elif [ "$MACHINE_AUTH" = "1" ] && [ -n "$USER" ] && [ -n "$PASSWORD" ]; then
     AUTH_MODE="both"
-elif [ -n "$AUTH_HASH" ]; then
+elif [ "$MACHINE_AUTH" = "1" ]; then
     AUTH_MODE="hash_only"
 elif [ -n "$USER" ] && [ -n "$PASSWORD" ]; then
     AUTH_MODE="credentials_only"
@@ -79,6 +87,9 @@ fi
 
 echo "========================================="
 echo "Authentication Mode: $AUTH_MODE"
+if [ "$AUTH_MODE" = "oidc_only" ] && [ "$MACHINE_AUTH" = "1" ]; then
+    echo "  + machine/API bypass enabled (hash and/or CasaOS credentials via header)"
+fi
 echo "========================================="
 
 # Start auth service if any authentication is configured (for session management)
@@ -134,16 +145,18 @@ case "$AUTH_MODE" in
         ;;
 
     "hash_only")
-        echo "Hash-only authentication configured (with session support)"
-        AUTH_CHECK_BLOCK="            # Hash-only authentication with session
+        echo "Machine/API authentication configured (hash via ?hash=, Authorization: Basic, or Bearer)"
+        AUTH_CHECK_BLOCK="            # Machine/API auth: ?hash=, or AUTH_HASH via Authorization Basic/Bearer
             auth_request /internal-auth-check;
             auth_request_set \$auth_cookie \$upstream_http_set_cookie;
             add_header Set-Cookie \$auth_cookie;
-            error_page 401 = @auth_failed_403;"
+            error_page 401 = @auth_failed_basic;"
 
-        # Add named location for auth failure handling (returns 403, no login page)
-        sed -i 's|location / {|location @auth_failed_403 {\
-            return 403;\
+        # Machine-only mode: on failure issue a true HTTP Basic challenge so clients
+        # (curl -u, etc.) are prompted to authenticate. No human login page.
+        sed -i 's|location / {|location @auth_failed_basic {\
+            add_header WWW-Authenticate '\''Basic realm="AppShield"'\'' always;\
+            return 401;\
         }\
 \
         location / {|' /etc/nginx/nginx.conf

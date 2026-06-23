@@ -19,6 +19,43 @@ const SESSION_DURATION_MS = SESSION_DURATION_HOURS * 60 * 60 * 1000;
 const OIDC_REGISTRAR_URL = (process.env.OIDC_REGISTRAR_URL || '').replace(/\/+$/, '');
 const OIDC_ENABLED = OIDC_REGISTRAR_URL.length > 0;
 
+// External credential validation (MACHINE / API, no redirect). When set, an
+// Authorization header (HTTP Basic `user:pass` or `Bearer <token>`) that does NOT
+// match the static AUTH_HASH is forwarded to this URL for verification — e.g. the
+// casaos-oidc-bridge `/validate` endpoint, which checks it against CasaOS. This lets
+// API clients authenticate with their real CasaOS identity instead of (or alongside)
+// a shared AUTH_HASH. It is product-agnostic: AppShield only knows "POST the header
+// here, 200 = valid". Optional shared secret guards the validator endpoint.
+const CREDENTIAL_VALIDATE_URL = (process.env.CREDENTIAL_VALIDATE_URL || '').replace(/\/+$/, '');
+const CREDENTIAL_VALIDATE_SECRET = process.env.CREDENTIAL_VALIDATE_SECRET || '';
+const CREDENTIAL_CACHE_TTL_MS = parseInt(process.env.CREDENTIAL_CACHE_TTL_SECONDS || '60', 10) * 1000;
+// Cache of validated Authorization headers: sha256(header) -> expiry. Avoids calling
+// the validator (and CasaOS) on every request from a machine that re-sends creds.
+const credCache = new Map();
+
+// Validate an Authorization header against the external validator, with caching.
+async function validateCredentialHeader(authHeader) {
+    if (!CREDENTIAL_VALIDATE_URL || !authHeader) return false;
+    const key = crypto.createHash('sha256').update(authHeader).digest('hex');
+    const cached = credCache.get(key);
+    if (cached) {
+        if (cached > Date.now()) return true;
+        credCache.delete(key);
+    }
+    try {
+        const headers = { 'Authorization': authHeader };
+        if (CREDENTIAL_VALIDATE_SECRET) headers['X-Validate-Secret'] = CREDENTIAL_VALIDATE_SECRET;
+        const resp = await fetch(CREDENTIAL_VALIDATE_URL, { method: 'POST', headers });
+        if (resp.ok) {
+            if (CREDENTIAL_CACHE_TTL_MS > 0) credCache.set(key, Date.now() + CREDENTIAL_CACHE_TTL_MS);
+            return true;
+        }
+    } catch (e) {
+        console.log(`[Auth Service] Credential validation error: ${e.message}`);
+    }
+    return false;
+}
+
 // Generate password hash for session validation
 // When password changes (container restart), password-based sessions become invalid
 const PASSWORD_HASH = crypto.createHash('sha256').update(PASSWORD + USERNAME).digest('hex');
@@ -271,7 +308,7 @@ app.post('/nhl-auth/login', async (req, res) => {
 });
 
 // Auth check endpoint (called by nginx auth_request)
-app.get('/nhl-auth/check', (req, res) => {
+app.get('/nhl-auth/check', async (req, res) => {
     // Check for existing session first
     let sessionId = req.cookies.nginxhashlock_session;
 
@@ -330,6 +367,44 @@ app.get('/nhl-auth/check', (req, res) => {
                 });
             }
 
+            return res.status(200).send('OK');
+        }
+    }
+
+    // No valid session — check the AUTH_HASH carried in the Authorization header.
+    // Machine / API clients (non-interactive) present the hash as either an HTTP
+    // Basic credential (true basic auth, e.g. `curl -u any:<hash>`) or a Bearer
+    // token. Validated against AUTH_HASH only — never USER/PASSWORD, which are the
+    // interactive (human) modes. Stateless: no session cookie is minted, the client
+    // simply re-sends the header on each request.
+    if (process.env.AUTH_HASH) {
+        const authHeader = req.headers['authorization'] || '';
+        let headerHashOk = false;
+        if (/^Bearer /i.test(authHeader)) {
+            headerHashOk = authHeader.slice(7).trim() === process.env.AUTH_HASH;
+        } else if (/^Basic /i.test(authHeader)) {
+            try {
+                const decoded = Buffer.from(authHeader.slice(6).trim(), 'base64').toString('utf8');
+                const sep = decoded.indexOf(':');
+                const user = sep >= 0 ? decoded.slice(0, sep) : decoded;
+                const pass = sep >= 0 ? decoded.slice(sep + 1) : '';
+                // Accept the hash as either field so `-u <hash>:` and `-u any:<hash>` both work.
+                headerHashOk = pass === process.env.AUTH_HASH || user === process.env.AUTH_HASH;
+            } catch (e) { /* malformed base64 — treat as no match */ }
+        }
+        if (headerHashOk) {
+            console.log('[Auth Service] Auth check passed via Authorization header (hash)');
+            return res.status(200).send('OK');
+        }
+    }
+
+    // Static hash didn't match — delegate the Authorization header to the external
+    // credential validator (e.g. the CasaOS bridge /validate) for real per-user API
+    // identity. Basic (user:pass) and Bearer (token) are both handled by the validator.
+    if (CREDENTIAL_VALIDATE_URL) {
+        const authHeader = req.headers['authorization'] || '';
+        if (authHeader && await validateCredentialHeader(authHeader)) {
+            console.log('[Auth Service] Auth check passed via external credential validation');
             return res.status(200).send('OK');
         }
     }

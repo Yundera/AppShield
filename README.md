@@ -25,8 +25,10 @@ environment:
 
 **Authentication Options:**
 ```yaml
-  # Hash-based authentication (automatically provided by CasaOS)
-  AUTH_HASH: $AUTH_HASH                  # Optional: For hash-based auth (CasaOS provides this)
+  # Hash authentication — MACHINE / API access (CasaOS provides this value).
+  # The secret can be presented three ways: ?hash=<value> in the URL, an
+  # "Authorization: Bearer <value>" header, or HTTP Basic ("-u any:<value>").
+  AUTH_HASH: $AUTH_HASH                  # Optional: enables machine/API auth (CasaOS provides this)
                                          # Important: Also add /?hash=$AUTH_HASH to x-casaos.index
 
   # Username/Password authentication
@@ -41,6 +43,16 @@ environment:
                                                      # issuer_url, and runs authorization_code + PKCE.
                                                      # No per-app secrets to configure.
                                                      # Must be reachable on the pcs network.
+
+  # CasaOS-credential API auth (MACHINE, real per-user identity, no redirect)
+  CREDENTIAL_VALIDATE_URL: ""             # When set, an "Authorization: Basic <user:pass>"
+                                          # or "Bearer <token>" that isn't the static AUTH_HASH
+                                          # is verified here — point it at the CasaOS bridge's
+                                          # /validate (e.g. http://casaos-oidc-bridge:8089/validate),
+                                          # which checks it against CasaOS. Lets API clients use
+                                          # `-u <casaos-user>:<casaos-pass>`. No browser redirect.
+  CREDENTIAL_VALIDATE_SECRET: ""          # Optional: shared secret, sent as X-Validate-Secret
+  CREDENTIAL_CACHE_TTL_SECONDS: "60"      # Optional: cache successful validations (default 60s)
 ```
 
 **Bypass Options:**
@@ -63,17 +75,51 @@ environment:
 
 ## Authentication Modes
 
-The system automatically selects the authentication mode based on which environment variables are configured:
+AppShield separates **two audiences**, configured independently:
+
+- **Humans** pick **one** interactive method (strict either/or): **Web login** (a
+  `USER`/`PASSWORD` form) **or** **SSO** (OIDC redirect to the PCS identity provider).
+  They are mutually exclusive — if `OIDC_REGISTRAR_URL` is set, it wins.
+- **Machines / API clients** use the **hash** (`AUTH_HASH`) — a non-interactive secret,
+  and an *addition*: set it alongside either human method (or on its own) and it composes.
+
+The three distinct mechanisms:
+
+| Mechanism | Audience | How the client presents it | Interactive? |
+|-----------|----------|----------------------------|--------------|
+| **Hash** | Machine / API | `?hash=<secret>` URL param **or** `Authorization: Bearer <secret>` **or** HTTP Basic (`-u any:<secret>`) | No |
+| **Web login** | Human | username/password form → session cookie | Yes |
+| **SSO (OIDC)** | Human | redirect to the identity provider (Dex → CasaOS), authorization_code + PKCE → session cookie | Yes |
+
+> **Hash = "true" HTTP Basic auth for machines.** In machine-only deployments the gate
+> answers an unauthenticated request with `401 WWW-Authenticate: Basic`, so standard tooling
+> (`curl -u`, HTTP client libraries) authenticates out of the box. The hash is the credential —
+> it is checked against `AUTH_HASH`, never `USER`/`PASSWORD`.
+
+> **CasaOS identity over the API.** Set `CREDENTIAL_VALIDATE_URL` (→ the CasaOS bridge's
+> `/validate`) so machine clients can authenticate with their **real CasaOS credentials** —
+> `-u <casaos-user>:<casaos-pass>` (HTTP Basic) or a CasaOS `Bearer` token — instead of, or
+> alongside, a shared `AUTH_HASH`. No browser redirect: the gate verifies the credential
+> out-of-band via the bridge (which checks it against CasaOS), so an API call carries a real
+> per-user identity. Successful checks are cached for `CREDENTIAL_CACHE_TTL_SECONDS`. This is
+> a machine mechanism — humans still use Web login or SSO. (OIDC's password grant can't reach
+> CasaOS through Dex, which is why this goes via the bridge, not Dex.)
+
+The mode is selected automatically from which variables are set:
 
 | OIDC_REGISTRAR_URL | AUTH_HASH | USER/PASSWORD | Mode | Behavior |
 |--------------------|-----------|---------------|------|----------|
 | ✅ Set  | *(any)* | *(any)* | **OIDC** | Self-registers with the PCS's identity provider, runs authorization_code+PKCE, drops a session cookie |
-| ❌      | ✅ Defined | ❌ Undefined | **Hash Only** | Require `?hash=` parameter, show 403 page on failure |
+| ❌      | ✅ Defined | ❌ Undefined | **Hash Only** | Machine/API: `?hash=`, Bearer, or HTTP Basic. `401 WWW-Authenticate: Basic` on failure |
 | ❌      | ❌ Undefined | ✅ Defined | **Credentials Only** | Show login page, require username/password, no hash option |
-| ❌      | ✅ Defined | ✅ Defined | **Both Methods** | Accept either hash parameter OR valid login session |
+| ❌      | ✅ Defined | ✅ Defined | **Both Methods** | Machine hash (`?hash=` / Bearer / Basic) **or** human web login |
 | ❌      | ❌ Undefined | ❌ Undefined | **No Authentication** | Allow all requests (security disabled) |
 
-> **OIDC mode** currently supersedes hash/credentials rather than composing with them. Mixing is on the roadmap.
+> **OIDC + hash compose.** Set `OIDC_REGISTRAR_URL` **and** `AUTH_HASH` together to serve
+> both audiences from one gate: interactive users get the SSO redirect, while non-interactive
+> API / non-human clients pass `?hash=YOUR_SECRET_HASH` and bypass the redirect. The auth
+> service honours a valid hash in any mode. (Static `USER`/`PASSWORD` credential mode does
+> **not** compose with OIDC — use hash for machine access alongside OIDC.)
 
 ### Important for CasaOS Deployments
 
