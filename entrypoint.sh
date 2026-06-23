@@ -1,6 +1,6 @@
 #!/bin/sh
 
-echo "Starting nginxhashlock..."
+echo "Starting AppShield..."
 
 # On first run, save the original template
 if [ ! -f /etc/nginx/nginx.conf.template ]; then
@@ -186,7 +186,7 @@ case "$AUTH_MODE" in
         echo "OIDC authentication configured (registrar=$OIDC_REGISTRAR_URL)"
         AUTH_CHECK_BLOCK="            # OIDC authentication — auth service validates the session cookie;
             # on 401 the browser is redirected to the auth service's /nhl-auth/oidc/login
-            # endpoint, which kicks off the authorization_code flow against Authelia.
+            # endpoint, which kicks off the authorization_code flow against the SSO provider (Dex, via the registrar).
             auth_request /internal-auth-check;
             auth_request_set \$auth_cookie \$upstream_http_set_cookie;
             add_header Set-Cookie \$auth_cookie;

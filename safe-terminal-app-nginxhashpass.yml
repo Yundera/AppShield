@@ -2,7 +2,7 @@ name: yunderaterminalpass
 
 services:
   yunderaterminalpass:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     container_name: yunderaterminalpass
     restart: unless-stopped
     expose:
@@ -63,11 +63,11 @@ x-casaos:
     en_us: "Secure password-protected terminal access"
   category: Utilities
   description:
-    en_us: "A secure terminal with username/password authentication using nginxhashlock. Login with credentials for session-based access with configurable duration."
+    en_us: "A secure terminal with username/password authentication using AppShield. Login with credentials for session-based access with configurable duration."
   title:
     en_us: "Yundera Terminal (Password Auth)"
   store_app_id: yunderaterminalpass
   is_uncontrolled: false
-  # nginxhashlock will show login page - no hash needed
+  # AppShield will show login page - no hash needed
   index: /
   webui_port: 80

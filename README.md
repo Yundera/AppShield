@@ -1,10 +1,10 @@
-# NGINX Hash Lock
+# AppShield
 
 A lightweight NGINX-based authentication proxy that protects web applications using **hash-based authentication** and **username/password authentication**.
 
 ## What It Does
 
-NGINX Hash Lock sits in front of your application and provides flexible authentication options:
+AppShield sits in front of your application and provides flexible authentication options:
 
 1. **Hash Authentication**: Block requests unless they include `?hash=YOUR_SECRET_HASH`
 2. **Username/Password Authentication**: Show a login page requiring credentials
@@ -34,7 +34,7 @@ environment:
   PASSWORD: "your-secure-password"       # Optional: Password for login page
   SESSION_DURATION_HOURS: "720"          # Optional: Session duration in hours (default: 720 = 30 days)
 
-  # OIDC authentication (Yundera-managed identity provider)
+  # OIDC authentication (registrar-driven SSO)
   OIDC_REGISTRAR_URL: "http://auth-registrar:9092"  # Setting this enables OIDC mode. The sidecar
                                                      # self-registers with the registrar at first
                                                      # login, gets back client_id + client_secret +
@@ -77,7 +77,7 @@ The system automatically selects the authentication mode based on which environm
 
 ### Important for CasaOS Deployments
 
-**`$AUTH_HASH` is automatically provided by Yundera's CasaOS** - you don't need to manually configure it. However, you must:
+**`$AUTH_HASH` is automatically provided by CasaOS** - you don't need to manually configure it. However, you must:
 
 1. **Include `$AUTH_HASH` in the environment** (CasaOS will populate it)
 2. **Add `?hash=$AUTH_HASH` to the index** in x-casaos metadata
@@ -95,7 +95,7 @@ This ensures the Dashboard button automatically includes the authentication hash
 
 ### Critical: Container Naming for Subdomain Routing
 
-**The NGINX Hash Lock container MUST have the same name as the app.** The mesh-router routes subdomains based on container name matching the app name in `docker-compose.yml`.
+**The AppShield container MUST have the same name as the app.** The mesh-router routes subdomains based on container name matching the app name in `docker-compose.yml`.
 
 **Correct Setup:**
 ```yaml
@@ -103,7 +103,7 @@ name: myapp                          # App name
 
 services:
   myapp:                             # ← Service name matches app name
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     container_name: myapp            # ← Container name matches app name
     environment:
       BACKEND_HOST: "myapp-backend"  # ← Points to backend
@@ -118,9 +118,18 @@ x-casaos:
 ```
 
 **Why this matters:**
-- Subdomain `myapp-username.nsl.sh` routes to container named `myapp`
-- If the backend has the app name, traffic bypasses NGINX Hash Lock entirely
+- Subdomain `myapp-username.example.com` routes to container named `myapp`
+- If the backend has the app name, traffic bypasses AppShield entirely
 - The nginx proxy must "claim" the app name for proper routing
+
+> **OIDC mode enforces this too.** When OIDC is enabled, AppShield self-registers
+> with the registrar, which derives the caller's identity from its **container name**
+> (Docker reverse-DNS on the network) and only authorizes redirect URIs whose hostname
+> first label equals that name (or starts with `<name>-`). So the gate container must be
+> named after the app's subdomain — e.g. for `myapp-username.example.com`, the AppShield
+> container must be named `myapp`. A sidecar named `myapp-proxy` will be **rejected**
+> (`redirect URI hostname ... must start with "myapp-proxy-"`). Setting `hostname:` alone
+> is not enough; it's the **container name** that the registrar reads.
 
 ## Docker Compose Examples
 
@@ -129,7 +138,7 @@ x-casaos:
 ```yaml
 services:
   hashlock:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     environment:
       AUTH_HASH: $AUTH_HASH            # CasaOS provides this
       BACKEND_HOST: "myapp"
@@ -156,7 +165,7 @@ x-casaos:
 ```yaml
 services:
   hashlock:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     environment:
       USER: $USER                      # Set in CasaOS or compose
       PASSWORD: $PASSWORD              # Set in CasaOS or compose
@@ -185,7 +194,7 @@ x-casaos:
 ```yaml
 services:
   hashlock:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     environment:
       AUTH_HASH: $AUTH_HASH            # Option 1: CasaOS hash
       USER: $USER                      # Option 2: Password auth
@@ -211,15 +220,20 @@ x-casaos:
 **CasaOS Dashboard button:** Opens with hash (quick access)
 **Alternative:** Visit without hash → Login page → Enter credentials → 30-day session
 
-### Example 4: OIDC via Yundera Authelia (zero-config, drop-in)
+### Example 4: OIDC (registrar-driven SSO, zero-config)
+
+> In OIDC mode the gate container **must be named after the app's subdomain** (see
+> [Container Naming](#critical-container-naming-for-subdomain-routing) above). Here the
+> app is `myapp`, so the AppShield container is `myapp` and the real app is `myapp-backend`.
 
 ```yaml
 services:
-  hashlock:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+  myapp:
+    image: ghcr.io/yundera/appshield:latest
+    container_name: myapp            # ← must match the app subdomain (= OIDC identity)
     environment:
       OIDC_REGISTRAR_URL: "http://auth-registrar:9092"  # Presence enables OIDC mode
-      BACKEND_HOST: "myapp"
+      BACKEND_HOST: "myapp-backend"
       BACKEND_PORT: "8080"
       LISTEN_PORT: "80"
     expose:
@@ -227,10 +241,11 @@ services:
     networks:
       - pcs                            # Required: must be on the pcs network to reach the registrar
     depends_on:
-      - myapp
+      - myapp-backend
 
-  myapp:
+  myapp-backend:
     image: your-app:latest
+    container_name: myapp-backend
 
 networks:
   pcs:
@@ -238,19 +253,19 @@ networks:
     name: pcs
 
 x-casaos:
-  main: hashlock
+  main: myapp
   index: /
   webui_port: 80
 ```
 
 **What happens at first user hit:**
-1. User hits `https://myapp-alice.nsl.sh/` → nginx runs `auth_request` → 401 (no cookie).
-2. Nginx redirects to `/nhl-auth/oidc/login`, which POSTs to `$OIDC_REGISTRAR_URL/register` (e.g. `http://auth-registrar:9092/register`).
-3. Registrar identifies the caller as container `hashlock` via PTR on the pcs network (or whatever the container is named — see the container-naming rule below), runs `register-oidc-client.sh`, returns `{client_id, client_secret, issuer_url}`.
-4. Sidecar initializes `openid-client`, kicks off authorization_code+PKCE, redirects browser to Authelia's `/authorize`.
-5. User logs in on Authelia → bounced back to `/nhl-auth/oidc/callback` → session cookie set → redirected to original URL.
+1. User hits `https://myapp-alice.example.com/` → nginx runs `auth_request` → 401 (no cookie).
+2. Nginx redirects to `/nhl-auth/oidc/login`, which POSTs to `$OIDC_REGISTRAR_URL/register` (e.g. `http://auth-registrar:9092/register`) with its callback URL.
+3. The registrar identifies the caller as container `myapp` via PTR on the pcs network, registers an OIDC client with the SSO provider, and returns `{client_id, client_secret, issuer_url}`.
+4. The sidecar initializes `openid-client`, kicks off authorization_code + PKCE (S256), and redirects the browser to the SSO provider's `/authorize`.
+5. The user logs in with the SSO provider → bounced back to `/nhl-auth/oidc/callback` → session cookie set → redirected to the original URL.
 
-Subsequent boots: the registrar's script is idempotent, same secret comes back, same OIDC client is reused.
+Subsequent boots: the registrar is idempotent — the same client and secret come back, so the OIDC client is reused.
 
 ## How It Works
 
@@ -322,7 +337,7 @@ This is similar to how signed URLs work on cloud storage services - the hash IS 
 ```yaml
 services:
   stremio:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     environment:
       AUTH_HASH: $AUTH_HASH
       USER: "admin"
@@ -340,13 +355,13 @@ services:
 
 ## Real-World Examples: Protected Terminal (CasaOS)
 
-### Hash-Only Authentication (safe-terminal-app-nginxhashlock.yml)
+### Hash-Only Authentication (safe-terminal-app-appshield.yml)
 Quick access via URL hash parameter - Dashboard button includes hash automatically:
 
 ```yaml
 services:
   yunderaterminal:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     environment:
       AUTH_HASH: $AUTH_HASH            # CasaOS provides this
       BACKEND_HOST: "ttyd"
@@ -375,7 +390,7 @@ Session-based login with username/password:
 ```yaml
 services:
   yunderaterminalpass:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     environment:
       USER: $USER                      # Set in CasaOS
       PASSWORD: $PASSWORD              # Set in CasaOS
@@ -406,7 +421,7 @@ Accept BOTH hash OR password for maximum flexibility:
 ```yaml
 services:
   yunderaterminalboth:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     environment:
       AUTH_HASH: $AUTH_HASH            # Option 1: CasaOS hash (Dashboard)
       USER: $USER                      # Option 2: Login page
@@ -523,8 +538,8 @@ Request → NGINX auth_request to auth service → Check session cookie
   ├─ Valid session (has oidcSub) → Backend
   └─ No/invalid session → Redirect to /nhl-auth/oidc/login
       ├─ First call: POST to auth-registrar → cache client creds in memory
-      └─ Redirect to Authelia /authorize (PKCE S256)
-          → Authelia login → /nhl-auth/oidc/callback
+      └─ Redirect to SSO provider /authorize (PKCE S256)
+          → SSO login → /nhl-auth/oidc/callback
           → Exchange code for tokens → Mint session with oidcSub → Backend
 ```
 
@@ -542,7 +557,7 @@ Other requests → Normal authentication flow
 
 ## Application Compatibility
 
-NGINX Hash Lock has been tested with:
+AppShield has been tested with:
 - **Stremio** - Media streaming (use `ALLOW_HASH_CONTENT_PATHS=true`)
 - **Jellyfin/Emby** - Media servers with transcoding
 - **Plex** - Media server with remote access
@@ -577,11 +592,11 @@ The `ALLOW_HASH_CONTENT_PATHS` feature is useful for:
 | HTTP/2 to backend | ❌ | Uses HTTP/1.1 for backend connections (sufficient for 99% of apps) |
 | Headers with underscores | ⚠️ | Ignored by default (nginx default behavior) |
 
-**Note on gRPC:** Applications using gRPC (some CI/CD tools, Kubernetes services) cannot be proxied through NGINX Hash Lock. gRPC requires a completely different nginx configuration using `grpc_pass` instead of `proxy_pass`.
+**Note on gRPC:** Applications using gRPC (some CI/CD tools, Kubernetes services) cannot be proxied through AppShield. gRPC requires a completely different nginx configuration using `grpc_pass` instead of `proxy_pass`.
 
 ## Proxy Behavior Configuration
 
-NGINX Hash Lock is designed to work with **any application** out of the box. The defaults prioritize compatibility over performance.
+AppShield is designed to work with **any application** out of the box. The defaults prioritize compatibility over performance.
 
 ### Environment Variables Reference
 
@@ -628,10 +643,10 @@ These issues are handled without configuration:
 
 The Docker image is automatically built and published to GitHub Container Registry via GitHub Actions on every push to `main`.
 
-**Image location:** `ghcr.io/yundera/nginx-hash-lock:latest`
+**Image location:** `ghcr.io/yundera/appshield:latest`
 
 For manual builds (development only):
 ```bash
-docker build -t krizcold/nginxhashlock:dev .
-docker push krizcold/nginxhashlock:dev
+docker build -t krizcold/appshield:dev .
+docker push krizcold/appshield:dev
 ```

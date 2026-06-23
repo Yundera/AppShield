@@ -2,7 +2,7 @@ name: yunderaterminalboth
 
 services:
   yunderaterminalboth:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     container_name: yunderaterminalboth
     restart: unless-stopped
     expose:

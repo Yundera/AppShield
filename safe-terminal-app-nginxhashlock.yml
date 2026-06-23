@@ -2,7 +2,7 @@ name: yunderaterminal
 
 services:
   yunderaterminal:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     container_name: yunderaterminal
     restart: unless-stopped
     expose:
@@ -61,7 +61,7 @@ x-casaos:
     en_us: "Secure hash-locked terminal access"
   category: Utilities
   description:
-    en_us: "A secure terminal with hash-based authentication using nginxhashlock"
+    en_us: "A secure terminal with hash-based authentication using AppShield"
   title:
     en_us: "Yundera Terminal"
   store_app_id: yunderaterminal
