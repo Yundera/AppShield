@@ -3,6 +3,7 @@ const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { Issuer, generators } = require('openid-client');
 
 const app = express();
@@ -19,15 +20,61 @@ const SESSION_DURATION_MS = SESSION_DURATION_HOURS * 60 * 60 * 1000;
 const OIDC_REGISTRAR_URL = (process.env.OIDC_REGISTRAR_URL || '').replace(/\/+$/, '');
 const OIDC_ENABLED = OIDC_REGISTRAR_URL.length > 0;
 
+// --- Public host set (multi-domain SSO) -------------------------------------
+// AppShield is reachable under several hostnames: the custom user domain plus
+// the IP-based nip.io / sslip.io fallbacks. We register an OIDC callback for ALL
+// of them, then pick the redirect_uri matching the host the user actually
+// arrived on — so a login on <app>-<userdomain> returns there, and a login on
+// the sslip.io host returns there. Hosts are computed with the SAME formula as
+// the Caddy labels and the mesh-router-auth registrar — keep the three in sync
+// (see SSO/AppShield host-formula doc). When DOMAIN/PUBLIC_IP_DASH aren't
+// injected, the set is empty and we fall back to the legacy request-Host behaviour.
+const APP_NAME = (process.env.APP_NAME || os.hostname() || '').toLowerCase();
+const DOMAIN = (process.env.DOMAIN || '').toLowerCase();
+const PUBLIC_IP_DASH = (process.env.PUBLIC_IP_DASH || '').toLowerCase();
+const DEFAULT_APP_HOST_TEMPLATES = ['{APP}-{DOMAIN}', '{APP}-{IP_DASH}.nip.io', '{APP}-{IP_DASH}.sslip.io'];
+const APP_HOST_TEMPLATES = (() => {
+    const raw = process.env.APP_HOST_TEMPLATES;
+    if (!raw) return DEFAULT_APP_HOST_TEMPLATES;
+    try {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr) && arr.length && arr.every((s) => typeof s === 'string' && s)) return arr;
+    } catch { /* fall through to warning */ }
+    console.warn('[Auth Service] APP_HOST_TEMPLATES must be a JSON string array — using defaults');
+    return DEFAULT_APP_HOST_TEMPLATES;
+})();
+const CALLBACK_PATH = '/nhl-auth/oidc/callback';
+
+function computeAppHosts(appName) {
+    const subst = { '{APP}': appName, '{DOMAIN}': DOMAIN, '{IP_DASH}': PUBLIC_IP_DASH };
+    const hosts = [];
+    for (const tpl of APP_HOST_TEMPLATES) {
+        if (tpl.includes('{DOMAIN}') && !DOMAIN) continue;
+        if (tpl.includes('{IP_DASH}') && !PUBLIC_IP_DASH) continue;
+        let h = tpl;
+        for (const [k, v] of Object.entries(subst)) h = h.split(k).join(v);
+        hosts.push(h.toLowerCase());
+    }
+    return hosts;
+}
+
+const APP_HOSTS = APP_NAME ? computeAppHosts(APP_NAME) : [];
+const ALLOWED_ORIGINS = new Set(APP_HOSTS.map((h) => `https://${h}`));
+// Preferred origin when a request arrives on a host we don't recognise.
+const CANONICAL_ORIGIN = APP_HOSTS.length ? `https://${APP_HOSTS[0]}` : null;
+if (OIDC_ENABLED) {
+    console.log(`[Auth Service] app=${APP_NAME} public hosts: ${APP_HOSTS.join(', ') || '(none — falling back to request Host)'}`);
+}
+
 // External credential validation (MACHINE / API, no redirect). When set, an
 // Authorization header (HTTP Basic `user:pass` or `Bearer <token>`) that does NOT
 // match the static AUTH_HASH is forwarded to this URL for verification — e.g. the
 // casaos-oidc-bridge `/validate` endpoint, which checks it against CasaOS. This lets
 // API clients authenticate with their real CasaOS identity instead of (or alongside)
 // a shared AUTH_HASH. It is product-agnostic: AppShield only knows "POST the header
-// here, 200 = valid". Optional shared secret guards the validator endpoint.
+// here, 200 = valid". The validator must be an internal-only endpoint — the bridge
+// serves /validate on a pcs-network-only port — so no shared secret is needed.
 const CREDENTIAL_VALIDATE_URL = (process.env.CREDENTIAL_VALIDATE_URL || '').replace(/\/+$/, '');
-const CREDENTIAL_VALIDATE_SECRET = process.env.CREDENTIAL_VALIDATE_SECRET || '';
 const CREDENTIAL_CACHE_TTL_MS = parseInt(process.env.CREDENTIAL_CACHE_TTL_SECONDS || '60', 10) * 1000;
 // Cache of validated Authorization headers: sha256(header) -> expiry. Avoids calling
 // the validator (and CasaOS) on every request from a machine that re-sends creds.
@@ -43,9 +90,7 @@ async function validateCredentialHeader(authHeader) {
         credCache.delete(key);
     }
     try {
-        const headers = { 'Authorization': authHeader };
-        if (CREDENTIAL_VALIDATE_SECRET) headers['X-Validate-Secret'] = CREDENTIAL_VALIDATE_SECRET;
-        const resp = await fetch(CREDENTIAL_VALIDATE_URL, { method: 'POST', headers });
+        const resp = await fetch(CREDENTIAL_VALIDATE_URL, { method: 'POST', headers: { 'Authorization': authHeader } });
         if (resp.ok) {
             if (CREDENTIAL_CACHE_TTL_MS > 0) credCache.set(key, Date.now() + CREDENTIAL_CACHE_TTL_MS);
             return true;
@@ -117,16 +162,31 @@ function getPublicOrigin(req) {
     return `${proto}://${host}`;
 }
 
+// Pick the callback URL for the host the request arrived on. Falls back to the
+// canonical host for an unrecognised host, and to the raw request origin when no
+// host set was configured (legacy single-host behaviour).
+function chosenRedirect(req) {
+    const origin = getPublicOrigin(req);
+    const base = ALLOWED_ORIGINS.has(origin) ? origin : (CANONICAL_ORIGIN || origin);
+    return `${base}${CALLBACK_PATH}`;
+}
+
 async function getOrInitOidcClient(publicOrigin) {
     if (oidcClient) return oidcClient;
 
-    const callbackUrl = `${publicOrigin}/nhl-auth/oidc/callback`;
-    console.log(`[Auth Service] Registering OIDC client with ${OIDC_REGISTRAR_URL} (callback=${callbackUrl})`);
+    // Register a callback for EVERY host AppShield is reachable under, so any of
+    // them is an accepted redirect_uri (the registrar verifies each against its
+    // own recomputed allowlist). Falls back to the single request origin when no
+    // host set is configured (DOMAIN/PUBLIC_IP_DASH not injected).
+    const callbacks = ALLOWED_ORIGINS.size > 0
+        ? [...ALLOWED_ORIGINS].map((o) => `${o}${CALLBACK_PATH}`)
+        : [`${publicOrigin}${CALLBACK_PATH}`];
+    console.log(`[Auth Service] Registering OIDC client with ${OIDC_REGISTRAR_URL} (callbacks=${callbacks.join(', ')})`);
 
     const response = await fetch(`${OIDC_REGISTRAR_URL}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ redirect_uris: [callbackUrl] }),
+        body: JSON.stringify({ redirect_uris: callbacks }),
     });
     if (!response.ok) {
         const body = await response.text();
@@ -139,7 +199,7 @@ async function getOrInitOidcClient(publicOrigin) {
     oidcClient = new issuer.Client({
         client_id,
         client_secret,
-        redirect_uris: [callbackUrl],
+        redirect_uris: callbacks,
         response_types: ['code'],
         token_endpoint_auth_method: 'client_secret_basic',
     });
@@ -286,7 +346,7 @@ app.post('/nhl-auth/login', async (req, res) => {
         console.log(`[Auth Service] Session created: ${sessionId.substring(0, 8)}... (expires in ${SESSION_DURATION_HOURS}h)`);
 
         // Set cookie and redirect
-        res.cookie('nginxhashlock_session', sessionId, {
+        res.cookie('appshield_session', sessionId, {
             httpOnly: true,
             secure: false, // Set to true if using HTTPS
             maxAge: SESSION_DURATION_MS,
@@ -310,7 +370,7 @@ app.post('/nhl-auth/login', async (req, res) => {
 // Auth check endpoint (called by nginx auth_request)
 app.get('/nhl-auth/check', async (req, res) => {
     // Check for existing session first
-    let sessionId = req.cookies.nginxhashlock_session;
+    let sessionId = req.cookies.appshield_session;
 
     if (sessionId && sessions[sessionId]) {
         const session = sessions[sessionId];
@@ -359,7 +419,7 @@ app.get('/nhl-auth/check', async (req, res) => {
                 console.log(`[Auth Service] Session created for hash auth: ${sessionId.substring(0, 8)}... (expires in ${SESSION_DURATION_HOURS}h)`);
 
                 // Set session cookie
-                res.cookie('nginxhashlock_session', sessionId, {
+                res.cookie('appshield_session', sessionId, {
                     httpOnly: true,
                     secure: false,
                     maxAge: SESSION_DURATION_MS,
@@ -410,7 +470,7 @@ app.get('/nhl-auth/check', async (req, res) => {
     }
 
     // Check session cookie again (for cases where hash auth wasn't valid)
-    sessionId = req.cookies.nginxhashlock_session;
+    sessionId = req.cookies.appshield_session;
 
     if (!sessionId) {
         console.log('[Auth Service] Auth check failed: No session cookie and no valid hash');
@@ -454,7 +514,7 @@ app.get('/nhl-auth/establish-session', (req, res) => {
 
         if (hash && hash === process.env.AUTH_HASH) {
             // Check if session already exists
-            let sessionId = req.cookies.nginxhashlock_session;
+            let sessionId = req.cookies.appshield_session;
 
             if (sessionId && sessions[sessionId]) {
                 const session = sessions[sessionId];
@@ -486,7 +546,7 @@ app.get('/nhl-auth/establish-session', (req, res) => {
             console.log(`[Auth Service] Session established via hash: ${sessionId.substring(0, 8)}... (expires in ${SESSION_DURATION_HOURS}h)`);
 
             // Set session cookie
-            res.cookie('nginxhashlock_session', sessionId, {
+            res.cookie('appshield_session', sessionId, {
                 httpOnly: true,
                 secure: false,
                 maxAge: SESSION_DURATION_MS,
@@ -537,6 +597,7 @@ app.get('/nhl-auth/oidc/login', async (req, res) => {
         pendingOidcFlows.set(state, { codeVerifier, originalUri, createdAt: Date.now() });
 
         const authUrl = client.authorizationUrl({
+            redirect_uri: chosenRedirect(req),
             scope: 'openid profile email groups',
             state,
             code_challenge: codeChallenge,
@@ -567,8 +628,11 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
         const flow = pendingOidcFlows.get(params.state);
         pendingOidcFlows.delete(params.state);
 
+        // The IdP redirected back to the same host the login used, so recomputing
+        // from the callback request yields the matching redirect_uri (required to
+        // equal the one sent at /authorize for the token exchange).
         const tokenSet = await client.callback(
-            `${publicOrigin}/nhl-auth/oidc/callback`,
+            chosenRedirect(req),
             params,
             { state: params.state, code_verifier: flow.codeVerifier },
         );
@@ -581,7 +645,7 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
         };
         console.log(`[Auth Service] OIDC session created for sub=${claims.sub} (${sessionId.substring(0, 8)}...)`);
 
-        res.cookie('nginxhashlock_session', sessionId, {
+        res.cookie('appshield_session', sessionId, {
             httpOnly: true,
             secure: false,
             maxAge: SESSION_DURATION_MS,

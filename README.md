@@ -48,10 +48,10 @@ environment:
   CREDENTIAL_VALIDATE_URL: ""             # When set, an "Authorization: Basic <user:pass>"
                                           # or "Bearer <token>" that isn't the static AUTH_HASH
                                           # is verified here — point it at the CasaOS bridge's
-                                          # /validate (e.g. http://casaos-oidc-bridge:8089/validate),
+                                          # INTERNAL /validate port (http://casaos-oidc-bridge:8090/validate),
                                           # which checks it against CasaOS. Lets API clients use
                                           # `-u <casaos-user>:<casaos-pass>`. No browser redirect.
-  CREDENTIAL_VALIDATE_SECRET: ""          # Optional: shared secret, sent as X-Validate-Secret
+                                          # The validator is pcs-network-only, so no secret is needed.
   CREDENTIAL_CACHE_TTL_SECONDS: "60"      # Optional: cache successful validations (default 60s)
 ```
 

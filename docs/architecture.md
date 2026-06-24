@@ -109,7 +109,7 @@ sequenceDiagram
         N->>A: proxy_pass
         A->>Z: POST /token (code + code_verifier)
         Z-->>A: {id_token, access_token}
-        A->>A: create session with oidcSub = claims.sub<br/>Set-Cookie: nginxhashlock_session
+        A->>A: create session with oidcSub = claims.sub<br/>Set-Cookie: appshield_session
         A-->>U: 302 → / (original URL)
     end
 
