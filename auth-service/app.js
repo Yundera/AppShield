@@ -21,41 +21,26 @@ const OIDC_REGISTRAR_URL = (process.env.OIDC_REGISTRAR_URL || '').replace(/\/+$/
 const OIDC_ENABLED = OIDC_REGISTRAR_URL.length > 0;
 
 // --- Public host set (multi-domain SSO) -------------------------------------
-// AppShield is reachable under several hostnames: the custom user domain plus
-// the IP-based nip.io / sslip.io fallbacks. We register an OIDC callback for ALL
-// of them, then pick the redirect_uri matching the host the user actually
-// arrived on — so a login on <app>-<userdomain> returns there, and a login on
-// the sslip.io host returns there. Hosts are computed with the SAME formula as
-// the Caddy labels and the mesh-router-auth registrar — keep the three in sync
-// (see SSO/AppShield host-formula doc). When DOMAIN/PUBLIC_IP_DASH aren't
-// injected, the set is empty and we fall back to the legacy request-Host behaviour.
+// AppShield is reachable under several hostnames (a custom domain, IP-based
+// fallbacks, etc.). We register an OIDC callback for ALL of them, then pick the
+// redirect_uri matching the host the user actually arrived on — login on
+// <app>-<suffixA> returns there, login on <app>-<suffixB> returns there.
+//
+// The host set is `<app>-<suffix>` for each suffix in REDIRECT_HOST_SUFFIXES
+// (comma-separated). The code knows NOTHING about specific domains or DNS
+// providers — the suffix list is pure config, supplied by the app's compose the
+// same way the caddy_* labels are. Keep the `<app>-<suffix>` join in sync with
+// the Caddy labels and the mesh-router-auth registrar. When the list is unset we
+// fall back to the legacy single request-Host behaviour.
 const APP_NAME = (process.env.APP_NAME || os.hostname() || '').toLowerCase();
-const DOMAIN = (process.env.DOMAIN || '').toLowerCase();
-const PUBLIC_IP_DASH = (process.env.PUBLIC_IP_DASH || '').toLowerCase();
-const DEFAULT_APP_HOST_TEMPLATES = ['{APP}-{DOMAIN}', '{APP}-{IP_DASH}.nip.io', '{APP}-{IP_DASH}.sslip.io'];
-const APP_HOST_TEMPLATES = (() => {
-    const raw = process.env.APP_HOST_TEMPLATES;
-    if (!raw) return DEFAULT_APP_HOST_TEMPLATES;
-    try {
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr) && arr.length && arr.every((s) => typeof s === 'string' && s)) return arr;
-    } catch { /* fall through to warning */ }
-    console.warn('[Auth Service] APP_HOST_TEMPLATES must be a JSON string array — using defaults');
-    return DEFAULT_APP_HOST_TEMPLATES;
-})();
+const REDIRECT_HOST_SUFFIXES = (process.env.REDIRECT_HOST_SUFFIXES || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
 const CALLBACK_PATH = '/nhl-auth/oidc/callback';
 
 function computeAppHosts(appName) {
-    const subst = { '{APP}': appName, '{DOMAIN}': DOMAIN, '{IP_DASH}': PUBLIC_IP_DASH };
-    const hosts = [];
-    for (const tpl of APP_HOST_TEMPLATES) {
-        if (tpl.includes('{DOMAIN}') && !DOMAIN) continue;
-        if (tpl.includes('{IP_DASH}') && !PUBLIC_IP_DASH) continue;
-        let h = tpl;
-        for (const [k, v] of Object.entries(subst)) h = h.split(k).join(v);
-        hosts.push(h.toLowerCase());
-    }
-    return hosts;
+    return REDIRECT_HOST_SUFFIXES.map((suffix) => `${appName}-${suffix}`.toLowerCase());
 }
 
 const APP_HOSTS = APP_NAME ? computeAppHosts(APP_NAME) : [];
@@ -177,7 +162,7 @@ async function getOrInitOidcClient(publicOrigin) {
     // Register a callback for EVERY host AppShield is reachable under, so any of
     // them is an accepted redirect_uri (the registrar verifies each against its
     // own recomputed allowlist). Falls back to the single request origin when no
-    // host set is configured (DOMAIN/PUBLIC_IP_DASH not injected).
+    // host set is configured (REDIRECT_HOST_SUFFIXES not injected).
     const callbacks = ALLOWED_ORIGINS.size > 0
         ? [...ALLOWED_ORIGINS].map((o) => `${o}${CALLBACK_PATH}`)
         : [`${publicOrigin}${CALLBACK_PATH}`];
