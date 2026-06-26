@@ -31,6 +31,20 @@ environment:
   AUTH_HASH: $AUTH_HASH                  # Optional: enables machine/API auth (CasaOS provides this)
                                          # Important: Also add /?hash=$AUTH_HASH to x-casaos.index
 
+  # How AUTH_HASH is sourced — AUTH_HASH_MODE: managed | env | off (default: off)
+  #   off      No hash-based machine auth; any incoming AUTH_HASH is ignored. (default)
+  #   env      Use AUTH_HASH from the environment as-is. The caller owns the value
+  #            and its lifecycle — e.g. interpolated from a persistent .env so it
+  #            survives uninstall/reinstall (see the Beacon app for the pattern).
+  #   managed  AppShield owns the token: it generates a 128-hex secret once into
+  #            AUTH_HASH_FILE (default /data/auth_hash) on a persistent volume and
+  #            reuses it on every restart/reinstall. Immune to platform-side
+  #            rotation. The incoming AUTH_HASH env is never read. Mount a volume
+  #            at /data and surface the token via the app itself — a managed token
+  #            is NOT shown through CasaOS tips.
+  AUTH_HASH_MODE: "off"                  # Optional: source/lifecycle of AUTH_HASH
+  AUTH_HASH_FILE: "/data/auth_hash"      # Optional: managed-mode token path (default shown)
+
   # Username/Password authentication
   USER: "admin"                          # Optional: Username for login page
   PASSWORD: "your-secure-password"       # Optional: Password for login page

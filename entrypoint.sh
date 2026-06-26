@@ -62,6 +62,58 @@ sed -i "s/PROXY_SEND_TIMEOUT_PLACEHOLDER/$PROXY_SEND_TIMEOUT/g" /etc/nginx/nginx
 sed -i "s/PROXY_READ_TIMEOUT_PLACEHOLDER/$PROXY_READ_TIMEOUT/g" /etc/nginx/nginx.conf
 sed -i "s/CLIENT_MAX_BODY_SIZE_PLACEHOLDER/$CLIENT_MAX_BODY_SIZE/g" /etc/nginx/nginx.conf
 
+# ---------------------------------------------------------------------------
+# AUTH_HASH source selection — AUTH_HASH_MODE: managed | env | off (default off)
+#
+#   off      No hash-based machine auth. Any incoming AUTH_HASH is ignored.
+#            This is the default: hash auth must be opted into explicitly.
+#
+#   env      Use AUTH_HASH from the environment as-is. The caller owns the
+#            value and its lifecycle — e.g. interpolated from a persistent
+#            .env so it survives uninstall/reinstall (see the Beacon app).
+#
+#   managed  AppShield owns the token: generate a 64-byte (128 hex) secret once
+#            into AUTH_HASH_FILE on a persistent volume and reuse it on every
+#            restart/reinstall. Never reads the incoming AUTH_HASH env, so it is
+#            immune to platform-side rotation. NOTE: a managed token is not
+#            surfaced through CasaOS tips — expose it via the app itself.
+# ---------------------------------------------------------------------------
+AUTH_HASH_MODE="${AUTH_HASH_MODE:-off}"
+AUTH_HASH_FILE="${AUTH_HASH_FILE:-/data/auth_hash}"
+
+case "$AUTH_HASH_MODE" in
+    managed)
+        if [ ! -f "$AUTH_HASH_FILE" ]; then
+            mkdir -p "$(dirname "$AUTH_HASH_FILE")"
+            od -An -tx1 -N64 /dev/urandom | tr -d ' \n' > "$AUTH_HASH_FILE"
+            chmod 600 "$AUTH_HASH_FILE"
+            echo "AUTH_HASH_MODE=managed: generated new persistent token at $AUTH_HASH_FILE"
+        else
+            echo "AUTH_HASH_MODE=managed: reusing persistent token at $AUTH_HASH_FILE"
+        fi
+        AUTH_HASH="$(cat "$AUTH_HASH_FILE")"
+        ;;
+    env)
+        if [ -n "$AUTH_HASH" ]; then
+            echo "AUTH_HASH_MODE=env: using AUTH_HASH from environment"
+        else
+            echo "AUTH_HASH_MODE=env: no AUTH_HASH in environment (machine/API auth disabled)"
+        fi
+        ;;
+    off)
+        if [ -n "$AUTH_HASH" ]; then
+            echo "AUTH_HASH_MODE=off: ignoring AUTH_HASH from environment"
+        fi
+        AUTH_HASH=""
+        ;;
+    *)
+        echo "ERROR: invalid AUTH_HASH_MODE '$AUTH_HASH_MODE' (expected: managed | env | off)"
+        exit 1
+        ;;
+esac
+# Export so the node auth-service child inherits the resolved value.
+export AUTH_HASH
+
 # Determine authentication mode
 # OIDC handles interactive (human) logins. A static AUTH_HASH MAY be set alongside
 # OIDC for non-interactive API / non-human access: the auth service honours a valid
