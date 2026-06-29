@@ -144,8 +144,10 @@ if [ "$AUTH_MODE" = "oidc_only" ] && [ "$MACHINE_AUTH" = "1" ]; then
 fi
 echo "========================================="
 
-# Start auth service if any authentication is configured (for session management)
-if [ "$AUTH_MODE" = "hash_only" ] || [ "$AUTH_MODE" = "credentials_only" ] || [ "$AUTH_MODE" = "both" ] || [ "$AUTH_MODE" = "oidc_only" ]; then
+# Start auth service if any authentication is configured (for session management).
+# Also start it when the MCP OAuth broker is enabled, since the provider runs
+# inside the auth-service node process.
+if [ "$AUTH_MODE" = "hash_only" ] || [ "$AUTH_MODE" = "credentials_only" ] || [ "$AUTH_MODE" = "both" ] || [ "$AUTH_MODE" = "oidc_only" ] || [ -n "$MCP_OAUTH_RESOURCE" ]; then
     echo "Starting authentication service..."
     export SESSION_DURATION_HOURS="${SESSION_DURATION_HOURS:-720}"
     cd /app/auth-service
@@ -347,6 +349,77 @@ fi
 
 # Apply authentication block to nginx configuration
 sed -i "s/AUTH_CHECK_BLOCK_PLACEHOLDER/$AUTH_CHECK_ESCAPED/" /etc/nginx/nginx.conf
+
+# ---------------------------------------------------------------------------
+# MCP OAuth 2.1 broker (opt-in via MCP_OAUTH_RESOURCE)
+# When enabled, write an include file with the OAuth/MCP location blocks and
+# splice it in via the MCP_OAUTH_BLOCK_PLACEHOLDER. When disabled, the
+# placeholder is removed -> byte-identical nginx behaviour to before.
+# ---------------------------------------------------------------------------
+if [ -n "$MCP_OAUTH_RESOURCE" ]; then
+    echo "MCP OAuth enabled (resource=$MCP_OAUTH_RESOURCE) — adding OAuth/MCP nginx routes"
+    mkdir -p "${OAUTH_DATA_DIR:-/data/oauth}"
+
+    cat > /tmp/mcp_oauth.conf <<EOF
+        # === MCP OAuth 2.1 broker — auth-service (oidc-provider) on :9999 ===
+        location = /.well-known/openid-configuration {
+            proxy_pass http://127.0.0.1:9999;
+            proxy_http_version 1.1;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Forwarded-Proto \$redirect_scheme;
+            proxy_set_header X-Forwarded-Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        }
+        location = /.well-known/oauth-authorization-server {
+            proxy_pass http://127.0.0.1:9999;
+            proxy_http_version 1.1;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Forwarded-Proto \$redirect_scheme;
+            proxy_set_header X-Forwarded-Host \$host;
+        }
+        location = /.well-known/oauth-protected-resource {
+            proxy_pass http://127.0.0.1:9999;
+            proxy_http_version 1.1;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Forwarded-Proto \$redirect_scheme;
+        }
+        # Provider protocol + interaction + admin page (admin self-gates in node)
+        location ^~ /AppShield/ {
+            proxy_pass http://127.0.0.1:9999;
+            proxy_http_version 1.1;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Forwarded-Proto \$redirect_scheme;
+            proxy_set_header X-Forwarded-Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header Cookie \$http_cookie;
+        }
+        # /mcp — gated by Bearer JWT / hash via auth_request. On a 401 from the
+        # auth subrequest, nginx auto-propagates its WWW-Authenticate header to
+        # the client (the RFC 9728 discovery challenge set by /nhl-auth/check),
+        # so no human login redirect and no manual header re-emission is needed.
+        location ^~ /mcp {
+            auth_request /internal-auth-check;
+            set \$backend_upstream "$BACKEND_HOST:$BACKEND_PORT";
+            proxy_pass http://\$backend_upstream;
+            proxy_http_version 1.1;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$redirect_scheme;
+            proxy_set_header X-Forwarded-Host \$host;
+            proxy_set_header X-Forwarded-Port \$server_port;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \$connection_upgrade;
+            proxy_set_header Authorization \$http_authorization;
+        }
+EOF
+
+    sed -i 's|MCP_OAUTH_BLOCK_PLACEHOLDER|        include /tmp/mcp_oauth.conf;|' /etc/nginx/nginx.conf
+else
+    sed -i 's|MCP_OAUTH_BLOCK_PLACEHOLDER||' /etc/nginx/nginx.conf
+fi
 
 echo "========================================="
 echo "Final nginx configuration:"

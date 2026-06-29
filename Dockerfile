@@ -1,9 +1,12 @@
 FROM nginx:latest
 
-# Install Node.js and npm
+# Install Node.js and npm.
+# Node 22 LTS is required by oidc-provider v9 (it uses URL.parse, added in Node
+# 20.18/22) and Node 18 is EOL. The existing express/openid-client stack is
+# fully compatible with Node 22.
 RUN apt-get update && \
     apt-get install -y curl && \
-    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
