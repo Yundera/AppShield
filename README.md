@@ -564,6 +564,22 @@ Two things stay locally computed on purpose:
 - **The canonical origin** (`<app>-<first suffix>`) is never re-derived from the registrar's list. With `OAUTH_RESOURCE` set it becomes the OAuth issuer, which is baked into already-issued tokens and into discovery documents remote clients cache — moving it would invalidate all of them.
 - **Session cookies stay host-scoped.** Logging in on the bare domain and on `myapp-example.com` yields two independent sessions. That was already true across the nip.io/sslip.io hosts; this change stops the host from *switching* mid-login, it does not merge sessions across hosts.
 
+### OIDC back-channel
+
+The issuer the registrar returns is a public hostname, and must be: it is the `iss` of every token and where the browser is sent. But the gate also calls the issuer itself — discovery, the code→token exchange, the JWKS fetch — and from inside a deployment that hostname resolves to the outside: the calls leave the machine, cross the gateway/CDN and come back in, for traffic between two containers on one bridge.
+
+When the registrar also returns `internal_issuer_url` (mesh-auth `INTERNAL_ISSUER_URL`, e.g. `http://dex:5556`), the gate sends every request for a URL under `issuer_url` to the same path under the internal address instead. Nothing else changes: the issuer string, the tokens' `iss`, and the authorization and end-session URLs the browser is redirected to all stay public.
+
+There is nothing to configure on the gate. No field ⇒ today's behaviour. The startup line says which path is in use:
+
+```
+[oidc] registered with http://auth-registrar:9092 as client myapp (issuer https://auth-alice.example.com, back-channel via http://dex:5556)
+```
+
+An internal address that does not answer fails the login (502, retried on the next attempt) rather than falling back to the public path — a silent detour would hide exactly the problem this removes.
+
+This replaces the deployment-side workaround of pinning the issuer hostname with `extra_hosts` and adding the proxy's CA through `SSL_CERT_DIR`: a gate on an `internal_issuer_url` needs neither, nor the CA mount.
+
 ## How It Works
 
 ### Hash Authentication Mode

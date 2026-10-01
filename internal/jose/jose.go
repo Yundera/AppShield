@@ -3,7 +3,8 @@
 //
 // A full JOSE library would be the largest dependency in the binary, and the
 // gate uses exactly one algorithm with exactly one key. The JWK encoding is
-// deliberately byte-compatible with what `jose`'s exportJWK wrote in 2.x, so an
+// deliberately byte-compatible with what `jose`'s exportJWK wrote in 2.x, and
+// ParseKey also accepts the {"keys":[…]} set 2.x wrapped it in on disk, so an
 // existing /data/oauth/jwks.json keeps working and the signing key does not
 // rotate on upgrade.
 package jose
@@ -118,15 +119,27 @@ func bigEndianExponent(e int) []byte {
 	return b
 }
 
-// ParseKey reads a private key from JWK JSON.
+// ParseKey reads a private key from JWK JSON: either a bare JWK (what 3.x
+// writes) or a JWKS holding exactly one key (what every 2.x wrote).
 //
 // It returns an error rather than falling back to generating a new key: a
 // parse bug that silently rotated the signing key would 401 every live access
 // token and break every client with a cached JWKS.
 func ParseKey(raw []byte) (*Key, error) {
-	var jwk JWK
-	if err := json.Unmarshal(raw, &jwk); err != nil {
+	var doc struct {
+		JWK
+		Keys []JWK `json:"keys"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("jwks.json is not valid JSON: %w", err)
+	}
+	jwk := doc.JWK
+	if doc.Keys != nil {
+		// Several keys would mean guessing which one signed the live tokens.
+		if len(doc.Keys) != 1 {
+			return nil, fmt.Errorf("jwks.json holds %d keys, want exactly 1", len(doc.Keys))
+		}
+		jwk = doc.Keys[0]
 	}
 	if jwk.Kty != "RSA" {
 		return nil, fmt.Errorf("unsupported key type %q, want RSA", jwk.Kty)

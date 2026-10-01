@@ -156,8 +156,8 @@ func TestMarshalParseRoundTrip(t *testing.T) {
 }
 
 // The migration case: an existing /data/oauth/jwks.json written by 2.x's `jose`
-// must load, or the broker silently rotates its signing key on upgrade and
-// every live access token starts failing.
+// must load, or the broker refuses to start on upgrade. 2.x wrote the key
+// wrapped in a set, `{"keys":[jwk]}` — the fixture keeps that exact shape.
 func TestParsesGenuineV2JWKS(t *testing.T) {
 	blob, err := os.ReadFile("testdata/v2-jwks.json")
 	if err != nil {
@@ -194,6 +194,9 @@ func TestParseKeyFailsClosed(t *testing.T) {
 		"public only":  `{"kty":"RSA","n":"AA","e":"AQAB"}`,
 		"bad base64":   `{"kty":"RSA","n":"!!!","e":"AQAB","d":"AA","p":"AA","q":"AA"}`,
 		"inconsistent": `{"kty":"RSA","n":"AQAB","e":"AQAB","d":"AQAB","p":"AQAB","q":"AQAB"}`,
+		"empty set":    `{"keys":[]}`,
+		"two keys":     `{"keys":[{"kty":"RSA"},{"kty":"RSA"}]}`,
+		"public set":   `{"keys":[{"kty":"RSA","n":"AA","e":"AQAB"}]}`,
 	}
 	for name, blob := range cases {
 		t.Run(name, func(t *testing.T) {
