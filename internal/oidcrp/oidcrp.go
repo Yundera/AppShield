@@ -58,6 +58,81 @@ type registration struct {
 	provider   *oidc.Provider
 	verifier   *oidc.IDTokenVerifier
 	endSession string
+
+	// http carries every request the gate itself sends to the issuer:
+	// discovery, the code exchange and the JWKS fetches. See backchannel.
+	http *http.Client
+}
+
+// backchannel keeps the gate's own calls to the issuer on the box.
+//
+// The issuer is a public hostname and has to stay one: the string is the
+// discovery URL, the `iss` of every token and where the browser is sent. But
+// resolved from inside a deployment it leads out through the gateway/CDN and
+// back in — for a call between two containers on one bridge. When the registrar
+// names an internal address for the same issuer, requests for a URL under the
+// public issuer go to the same path under the internal one instead.
+//
+// Only the dial moves. Every URL string is untouched, so go-oidc's issuer check
+// passes unmodified, and the authorization and end-session endpoints — which
+// the gate never fetches, only redirects to — stay public.
+type backchannel struct {
+	public, internal *url.URL
+	next             http.RoundTripper
+}
+
+func (b *backchannel) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Scheme != b.public.Scheme || r.URL.Host != b.public.Host {
+		return b.next.RoundTrip(r)
+	}
+	// Under the issuer's path, on a segment boundary: /dex and /dex/token, not
+	// /dexter.
+	rest, ok := strings.CutPrefix(r.URL.Path, b.public.Path)
+	if !ok || (rest != "" && rest[0] != '/') {
+		return b.next.RoundTrip(r)
+	}
+	r = r.Clone(r.Context()) // a RoundTripper must not modify its request
+	r.URL.Scheme, r.URL.Host = b.internal.Scheme, b.internal.Host
+	r.URL.Path, r.URL.RawPath = b.internal.Path+rest, ""
+	r.Host = ""
+	return b.next.RoundTrip(r)
+}
+
+// backchannelClient builds the client for the gate's calls to the issuer. With
+// no internal address it is the plain client, and those calls go wherever the
+// public issuer resolves.
+func (c *Client) backchannelClient(issuer, internal string) (*http.Client, error) {
+	if internal == "" {
+		return c.http, nil
+	}
+	pub, err := parseBase(issuer)
+	if err != nil {
+		return nil, fmt.Errorf("issuer_url: %w", err)
+	}
+	in, err := parseBase(internal)
+	if err != nil {
+		return nil, fmt.Errorf("internal_issuer_url: %w", err)
+	}
+	next := c.http.Transport
+	if next == nil {
+		next = http.DefaultTransport
+	}
+	return &http.Client{
+		Timeout:   c.http.Timeout,
+		Transport: &backchannel{public: pub, internal: in, next: next},
+	}, nil
+}
+
+func parseBase(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("%q is not an http(s) URL", raw)
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	return u, nil
 }
 
 type Client struct {
@@ -114,10 +189,13 @@ type registerRequest struct {
 }
 
 type registerResponse struct {
-	ClientID     string   `json:"client_id"`
-	ClientSecret string   `json:"client_secret"`
-	IssuerURL    string   `json:"issuer_url"`
-	RedirectURIs []string `json:"redirect_uris"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	IssuerURL    string `json:"issuer_url"`
+	// The same issuer as reached from inside the deployment. Optional: a
+	// registrar that does not send it leaves the gate on the public path.
+	InternalIssuerURL string   `json:"internal_issuer_url"`
+	RedirectURIs      []string `json:"redirect_uris"`
 }
 
 // ensure returns the registration, performing it on first use. A failure is
@@ -174,7 +252,16 @@ func (c *Client) ensure(ctx context.Context, publicOrigin string) (*registration
 	}
 	c.adoptRedirectURIs(callbacks)
 
-	provider, err := oidc.NewProvider(ctx, rr.IssuerURL)
+	// No fallback to the public path when the internal one fails: a silent
+	// detour is exactly what hid the round trip this exists to remove. The
+	// failure is not cached, so the next login retries.
+	backHTTP, err := c.backchannelClient(rr.IssuerURL, rr.InternalIssuerURL)
+	if err != nil {
+		return nil, err
+	}
+	// The provider keeps this client for its key set, so later JWKS refreshes
+	// follow it too.
+	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, backHTTP), rr.IssuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("discovering %s: %w", rr.IssuerURL, err)
 	}
@@ -190,8 +277,13 @@ func (c *Client) ensure(ctx context.Context, publicOrigin string) (*registration
 		provider:     provider,
 		verifier:     provider.Verifier(&oidc.Config{ClientID: rr.ClientID}),
 		endSession:   meta.EndSession,
+		http:         backHTTP,
 	}
-	log.Printf("[oidc] registered with %s as client %s (issuer %s)", c.cfg.RegistrarURL, rr.ClientID, rr.IssuerURL)
+	via := "the public issuer"
+	if rr.InternalIssuerURL != "" {
+		via = rr.InternalIssuerURL
+	}
+	log.Printf("[oidc] registered with %s as client %s (issuer %s, back-channel via %s)", c.cfg.RegistrarURL, rr.ClientID, rr.IssuerURL, via)
 	return c.reg, nil
 }
 
@@ -324,7 +416,7 @@ func (c *Client) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, err := c.oauth2Config(reg, r).Exchange(r.Context(), q.Get("code"), oauth2.VerifierOption(f.verifier))
+	tok, err := c.oauth2Config(reg, r).Exchange(oidc.ClientContext(r.Context(), reg.http), q.Get("code"), oauth2.VerifierOption(f.verifier))
 	if err != nil {
 		log.Printf("[oidc] code exchange failed: %v", err)
 		http.Error(w, "Sign-in failed", http.StatusBadGateway)

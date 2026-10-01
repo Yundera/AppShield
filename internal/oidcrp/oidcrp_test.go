@@ -26,10 +26,21 @@ func now() time.Time { return time.UnixMilli(testNowMS) }
 // that mints ID tokens we control.
 type fakeOP struct {
 	*httptest.Server
-	key       *jose.Key
+	key *jose.Key
+	// public, when set, is the issuer the OP claims to be — in discovery and in
+	// every token — while actually listening on URL. That is a deployment where
+	// the issuer's public hostname and its on-box address differ.
+	public    string
 	idClaims  map[string]any // claims to put in the next id_token
 	sawPKCE   atomic.Bool
 	tokenHits atomic.Int32
+}
+
+func (op *fakeOP) issuer() string {
+	if op.public != "" {
+		return op.public
+	}
+	return op.URL
 }
 
 func newFakeOP(t *testing.T) *fakeOP {
@@ -43,11 +54,11 @@ func newFakeOP(t *testing.T) *fakeOP {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
-			"issuer":                 op.URL,
-			"authorization_endpoint": op.URL + "/auth",
-			"token_endpoint":         op.URL + "/token",
-			"jwks_uri":               op.URL + "/jwks",
-			"end_session_endpoint":   op.URL + "/logout",
+			"issuer":                 op.issuer(),
+			"authorization_endpoint": op.issuer() + "/auth",
+			"token_endpoint":         op.issuer() + "/token",
+			"jwks_uri":               op.issuer() + "/jwks",
+			"end_session_endpoint":   op.issuer() + "/logout",
 		})
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +71,7 @@ func newFakeOP(t *testing.T) *fakeOP {
 			op.sawPKCE.Store(true)
 		}
 		claims := map[string]any{
-			"iss": op.URL,
+			"iss": op.issuer(),
 			"aud": clientID,
 			"sub": "user-1",
 			"exp": time.Now().Add(time.Hour).Unix(),
@@ -92,7 +103,7 @@ func newFakeOP(t *testing.T) *fakeOP {
 func (op *fakeOP) signLogoutToken(t *testing.T, override map[string]any) string {
 	t.Helper()
 	claims := map[string]any{
-		"iss": op.URL,
+		"iss": op.issuer(),
 		"aud": clientID,
 		"iat": time.Now().Unix(),
 		"exp": time.Now().Add(2 * time.Minute).Unix(),
@@ -265,6 +276,149 @@ func TestFailedRegistrationIsRetried(t *testing.T) {
 	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
 	if rec.Code != http.StatusFound {
 		t.Errorf("retry status = %d, want 302 — a failure was cached", rec.Code)
+	}
+}
+
+// --- internal issuer -----------------------------------------------------
+
+// publicIssuer cannot be resolved, so any request the gate sends to it rather
+// than to the internal address fails the test on its own.
+const publicIssuer = "https://auth-example.invalid"
+
+func newInternalOP(t *testing.T) (*fakeOP, *fakeRegistrar) {
+	t.Helper()
+	op := newFakeOP(t)
+	op.public = publicIssuer
+	reg := newFakeRegistrar(t, op)
+	reg.respond = func() map[string]any {
+		return map[string]any{
+			"client_id":           clientID,
+			"client_secret":       "test-secret",
+			"issuer_url":          publicIssuer,
+			"internal_issuer_url": op.URL,
+		}
+	}
+	return op, reg
+}
+
+// Discovery, the code exchange and the JWKS fetch all go to the internal
+// address, while the identity and everything the browser sees stay public.
+func TestInternalIssuerKeepsTheBackChannelOnBox(t *testing.T) {
+	op, reg := newInternalOP(t)
+	op.idClaims = map[string]any{"sid": "sid-1"}
+	c, store, mux := newClient(t, reg, nil)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("login status = %d, want 302 — discovery did not use the internal address: %s", rec.Code, rec.Body.String())
+	}
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+	if !strings.HasPrefix(loc.String(), publicIssuer+"/auth") {
+		t.Errorf("Location = %q, want the PUBLIC authorization endpoint", loc)
+	}
+
+	rec = callback(t, mux, loc.Query().Get("state"))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("callback status = %d, want 302 — the exchange or the JWKS fetch left the box: %s", rec.Code, rec.Body.String())
+	}
+	if n := op.tokenHits.Load(); n != 1 {
+		t.Errorf("internal token endpoint was hit %d times, want 1", n)
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("cookies = %+v", cookies)
+	}
+	sess, ok := store.Get(cookies[0].Value)
+	if !ok {
+		t.Fatal("no session was created")
+	}
+
+	if got := c.EndSessionURL(request("GET", "/"), sess); !strings.HasPrefix(got, publicIssuer+"/logout?") {
+		t.Errorf("end-session URL = %q, want the PUBLIC endpoint", got)
+	}
+
+	// A logout token is issued by — and verified against — the public identity.
+	form := strings.NewReader("logout_token=" + url.QueryEscape(op.signLogoutToken(t, nil)))
+	req := httptest.NewRequest("POST", BackchannelPath, form)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || store.Count() != 0 {
+		t.Errorf("back-channel logout: status %d, %d session(s) left", rec.Code, store.Count())
+	}
+}
+
+// An internal address that does not answer is a failed login, not a quiet
+// return to the public path — and it is retried, not cached.
+func TestUnusableInternalIssuerFailsInsteadOfFallingBack(t *testing.T) {
+	op := newFakeOP(t) // public issuer == a server that WOULD answer
+	reg := newFakeRegistrar(t, op)
+	internal := "::not a url::"
+	reg.respond = func() map[string]any {
+		return map[string]any{
+			"client_id":           clientID,
+			"client_secret":       "test-secret",
+			"issuer_url":          op.URL,
+			"internal_issuer_url": internal,
+		}
+	}
+	_, _, mux := newClient(t, reg, nil)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+
+	internal = op.URL
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
+	if rec.Code != http.StatusFound {
+		t.Errorf("retry status = %d, want 302 — the failure was cached", rec.Code)
+	}
+}
+
+type recordingTransport struct{ got *http.Request }
+
+func (rt *recordingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	rt.got = r
+	return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Request: r}, nil
+}
+
+func TestBackchannelRewritesOnlyURLsUnderTheIssuer(t *testing.T) {
+	for _, tc := range []struct {
+		name, issuer, internal, request, want string
+	}{
+		{"origin", "https://auth.example.com", "http://dex:5556", "https://auth.example.com/token", "http://dex:5556/token"},
+		{"query survives", "https://auth.example.com", "http://dex:5556", "https://auth.example.com/keys?x=1", "http://dex:5556/keys?x=1"},
+		{"issuer with a path", "https://example.com/dex", "http://dex:5556/dex/", "https://example.com/dex/token", "http://dex:5556/dex/token"},
+		{"path moves", "https://example.com/dex", "http://dex:5556", "https://example.com/dex/token", "http://dex:5556/token"},
+		{"sibling path", "https://example.com/dex", "http://dex:5556", "https://example.com/dexter/token", "https://example.com/dexter/token"},
+		{"outside the path", "https://example.com/dex", "http://dex:5556", "https://example.com/token", "https://example.com/token"},
+		{"another host", "https://auth.example.com", "http://dex:5556", "https://other.example.com/token", "https://other.example.com/token"},
+		{"another scheme", "https://auth.example.com", "http://dex:5556", "http://auth.example.com/token", "http://auth.example.com/token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &recordingTransport{}
+			c := &Client{http: &http.Client{Transport: rt}}
+			hc, err := c.backchannelClient(tc.issuer, tc.internal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, _ := http.NewRequest("GET", tc.request, nil)
+			resp, err := hc.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if got := rt.got.URL.String(); got != tc.want {
+				t.Errorf("dialled %q, want %q", got, tc.want)
+			}
+			if req.URL.String() != tc.request {
+				t.Errorf("the caller's request was modified: %q", req.URL)
+			}
+		})
 	}
 }
 
