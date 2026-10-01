@@ -643,6 +643,73 @@ func TestEndSessionURL(t *testing.T) {
 	}
 }
 
+// The OP has rotated away the key that signed this session's ID token — what a
+// 30-day gate session meets at an OP that keeps a key for about a day. A hint
+// the OP cannot verify is refused outright (Dex: 400), so it is left out, and
+// post_logout_redirect_uri with it: the OP only honours that for a client the
+// hint names.
+func TestEndSessionURLDropsAHintTheOPCanNoLongerVerify(t *testing.T) {
+	op := newFakeOP(t)
+	reg := newFakeRegistrar(t, op)
+	c, store, mux := newClient(t, reg, nil)
+
+	state := startLogin(t, mux, "")
+	rec := callback(t, mux, state)
+	sess, _ := store.Get(rec.Result().Cookies()[0].Value)
+
+	rotated, err := jose.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op.key = rotated
+
+	raw := c.EndSessionURL(request("GET", "/nhl-auth/logout"), sess)
+	if !strings.HasPrefix(raw, op.URL+"/logout") {
+		t.Fatalf("URL = %q, want the OP end-session endpoint — the OP session must still be ended", raw)
+	}
+	u, _ := url.Parse(raw)
+	q := u.Query()
+	if q.Has("id_token_hint") {
+		t.Error("sent an id_token_hint the OP cannot verify")
+	}
+	if q.Has("post_logout_redirect_uri") {
+		t.Error("sent post_logout_redirect_uri without a hint to name the client")
+	}
+	if q.Get("client_id") != clientID {
+		t.Errorf("client_id = %q", q.Get("client_id"))
+	}
+}
+
+// Expiry alone must not cost the hint: an OP accepts an expired one, and every
+// session older than the token lifetime holds exactly that.
+func TestEndSessionURLKeepsAnExpiredHint(t *testing.T) {
+	op := newFakeOP(t)
+	reg := newFakeRegistrar(t, op)
+	c, _, mux := newClient(t, reg, nil)
+	startLogin(t, mux, "") // registers, which is what gives the client its keys
+
+	expired, err := op.key.Sign("JWT", map[string]any{
+		"iss": op.URL,
+		"aud": clientID,
+		"sub": "user-1",
+		"iat": time.Now().Add(-48 * time.Hour).Unix(),
+		"exp": time.Now().Add(-24 * time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw := c.EndSessionURL(request("GET", "/nhl-auth/logout"), &session.Session{IDToken: expired})
+	u, _ := url.Parse(raw)
+	q := u.Query()
+	if q.Get("id_token_hint") != expired {
+		t.Error("an expired but verifiable hint was dropped")
+	}
+	if got := q.Get("post_logout_redirect_uri"); got != "https://beacon-example.com"+PostLogoutPath {
+		t.Errorf("post_logout_redirect_uri = %q", got)
+	}
+}
+
 // Logging out must never be the thing that first contacts the registrar.
 func TestEndSessionURLEmptyBeforeRegistration(t *testing.T) {
 	op := newFakeOP(t)

@@ -55,8 +55,11 @@ type registration struct {
 	clientSecret string
 	issuer       string
 
-	provider   *oidc.Provider
-	verifier   *oidc.IDTokenVerifier
+	provider *oidc.Provider
+	verifier *oidc.IDTokenVerifier
+	// jwksURI is kept for logout, which has to ask the OP for its keys afresh
+	// rather than trust the verifier's cache. See hintUsable.
+	jwksURI    string
 	endSession string
 
 	// http carries every request the gate itself sends to the issuer:
@@ -267,6 +270,7 @@ func (c *Client) ensure(ctx context.Context, publicOrigin string) (*registration
 	}
 	var meta struct {
 		EndSession string `json:"end_session_endpoint"`
+		JWKSURI    string `json:"jwks_uri"`
 	}
 	_ = provider.Claims(&meta)
 
@@ -276,6 +280,7 @@ func (c *Client) ensure(ctx context.Context, publicOrigin string) (*registration
 		issuer:       rr.IssuerURL,
 		provider:     provider,
 		verifier:     provider.Verifier(&oidc.Config{ClientID: rr.ClientID}),
+		jwksURI:      meta.JWKSURI,
 		endSession:   meta.EndSession,
 		http:         backHTTP,
 	}
@@ -556,11 +561,46 @@ func (c *Client) EndSessionURL(r *http.Request, sess *session.Session) string {
 		return ""
 	}
 	q := u.Query()
-	q.Set("id_token_hint", sess.IDToken)
 	q.Set("client_id", reg.clientID)
-	q.Set("post_logout_redirect_uri", c.chosenOrigin(r)+PostLogoutPath)
+	if c.hintUsable(r.Context(), reg, sess.IDToken) {
+		q.Set("id_token_hint", sess.IDToken)
+		q.Set("post_logout_redirect_uri", c.chosenOrigin(r)+PostLogoutPath)
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+// hintUsable reports whether the OP can still verify this session's ID token.
+//
+// The token is the one from login, kept for the whole session — 30 days by
+// default — while an OP rotates its signing keys far more often (Dex: every 6h,
+// each key kept for verification about a day more). An OP accepts an EXPIRED
+// hint, by spec, but not one whose signing key it has dropped: Dex answers 400
+// "Invalid id_token_hint" and the user is left on an error page, signed out of
+// this app and of nothing else.
+//
+// So check the signature against the OP's current key set first — fetched now,
+// not the login verifier's cached copy: that cache is only replaced when a
+// token arrives signed by a key it has never seen, so it goes on vouching for a
+// key long after the OP dropped it. When it no
+// longer verifies, the hint is left out — and post_logout_redirect_uri with it,
+// which an OP only honours for a client the hint names (Dex: 400 "requires
+// id_token_hint"). The OP then asks the user to confirm and ends its session on
+// its own page: one extra click, and no return to this app, in exchange for a
+// logout that works.
+//
+// A key set that cannot be fetched counts as unusable too. Sending a hint the
+// OP may reject is the failure being avoided; asking for a confirmation is not.
+func (c *Client) hintUsable(ctx context.Context, reg *registration, rawIDToken string) bool {
+	ctx, cancel := context.WithTimeout(oidc.ClientContext(ctx, reg.http), 5*time.Second)
+	defer cancel()
+	current := oidc.NewVerifier(reg.issuer, oidc.NewRemoteKeySet(ctx, reg.jwksURI),
+		&oidc.Config{ClientID: reg.clientID, SkipExpiryCheck: true})
+	if _, err := current.Verify(ctx, rawIDToken); err != nil {
+		log.Printf("[oidc] logout without id_token_hint: the session's ID token no longer verifies against the OP's keys (%v)", err)
+		return false
+	}
+	return true
 }
 
 // --- back-channel logout -------------------------------------------------

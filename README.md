@@ -307,6 +307,17 @@ app in the session, so one sign-out ends them all.
 that the IdP session outlives this one. It deliberately does not bounce to `/`: the OP
 would silently re-authenticate and logout would look broken.
 
+**When the session's ID token has outlived the OP's signing key**, the hint is left out. The
+gate keeps the ID token from login for the whole session (30 days by default), while an OP
+rotates its keys much more often — Dex every 6 hours, keeping each for about a day. An OP
+accepts an *expired* hint, but refuses one it can no longer verify (Dex: `400 Invalid
+id_token_hint`), which would strand the user on an error page with the OP session still
+alive. So the gate checks the token against the OP's current keys first, and when it does
+not verify it sends neither `id_token_hint` nor `post_logout_redirect_uri` (an OP only
+honours the latter for a client the hint names). The OP then asks the user to confirm and
+finishes on its own "logged out" page: one extra click and no return to the app, but the OP
+session really ends. The gate logs `logout without id_token_hint` when this happens.
+
 Either way this is **best effort**. No OIDC session, no discovered client, an OP without a
 logout endpoint, or a failure reaching it all fall through to the terminal page — failing
 to reach the OP must never trap a user inside an app whose session was already destroyed.
