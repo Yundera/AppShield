@@ -13,3 +13,9 @@ var LoginHTML []byte
 
 //go:embed 403.html
 var ForbiddenHTML []byte
+
+// UnavailableHTML is an html/template, not static bytes: it carries the
+// optional setup link and the URL its refresh goes back to. See oidcrp.
+//
+//go:embed unavailable.html
+var UnavailableHTML string

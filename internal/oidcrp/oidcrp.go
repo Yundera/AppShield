@@ -14,6 +14,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -40,7 +42,30 @@ const (
 	flowTTL = 10 * time.Minute
 
 	backchannelEvent = "http://schemas.openid.net/event/backchannel-logout"
+
+	// failureBackoff is how long a failed registration is answered from memory.
+	// Every page load during an outage would otherwise send a /register and a
+	// discovery request of its own.
+	failureBackoff = 5 * time.Second
+
+	// probeTTL is how long a successful liveness probe of the OP vouches for it,
+	// so a burst of logins costs one probe, not one each.
+	probeTTL = 5 * time.Second
+	// probeTimeout bounds the probe. The OP is on the box; one that takes longer
+	// than this to serve a static document is not going to complete a login.
+	probeTimeout = 2 * time.Second
+
+	// retryAfterSeconds is both the Retry-After header and the page's own
+	// refresh interval.
+	retryAfterSeconds = 15
 )
+
+// unavailablePage is shown instead of a bare 502 whenever sign-in cannot
+// proceed because the registrar or the OP is not answering. On a deployment
+// that runs no OP until it has a login method — a freshly installed box nobody
+// has claimed yet — that is the expected state, not a fault, so the page says
+// where to finish setup when the registrar names a place.
+var unavailablePage = template.Must(template.New("unavailable").Parse(web.UnavailableHTML))
 
 // flow is one in-flight authorization request, keyed by state.
 type flow struct {
@@ -148,6 +173,18 @@ type Client struct {
 	// first-logins into a single /register call.
 	regMu sync.Mutex
 	reg   *registration
+	// lastFailure is when ensure last failed; within failureBackoff of it the
+	// failure is returned again without contacting the registrar.
+	lastFailure time.Time
+	lastErr     error
+	// setupURL is where the registrar last said to finish setting the
+	// deployment up ("login_unavailable"). Empty when it named none.
+	setupURL string
+
+	// probeMu guards the last successful liveness probe of the OP.
+	probeMu  sync.Mutex
+	probed   *registration
+	probedAt time.Time
 
 	originsMu      sync.RWMutex
 	allowedOrigins map[string]bool
@@ -201,15 +238,40 @@ type registerResponse struct {
 	RedirectURIs      []string `json:"redirect_uris"`
 }
 
+// registerUnavailable is the registrar's answer when it cannot reach the OP —
+// on a box that runs none until it has a login method, the normal state of a
+// fresh install. setup_url, when present, is where to finish setting it up.
+type registerUnavailable struct {
+	Error    string `json:"error"`
+	SetupURL string `json:"setup_url"`
+}
+
 // ensure returns the registration, performing it on first use. A failure is
-// deliberately not cached: the next request retries rather than inheriting a
-// dead result forever.
+// remembered only for failureBackoff: after that the next request retries
+// rather than inheriting a dead result forever.
 func (c *Client) ensure(ctx context.Context, publicOrigin string) (*registration, error) {
 	c.regMu.Lock()
 	defer c.regMu.Unlock()
 	if c.reg != nil {
 		return c.reg, nil
 	}
+	if !c.lastFailure.IsZero() && c.now().Sub(c.lastFailure) < failureBackoff {
+		return nil, fmt.Errorf("backing off after a failed registration: %w", c.lastErr)
+	}
+	reg, err := c.register(ctx, publicOrigin)
+	if err != nil {
+		c.lastFailure, c.lastErr = c.now(), err
+		return nil, err
+	}
+	c.lastFailure, c.lastErr = time.Time{}, nil
+	// The OP answered, so whatever setup the registrar asked for is done.
+	c.setupURL = ""
+	c.reg = reg
+	return reg, nil
+}
+
+// register performs one registration. Callers hold regMu.
+func (c *Client) register(ctx context.Context, publicOrigin string) (*registration, error) {
 
 	guessed := c.guessRedirectURIs(publicOrigin)
 	body, _ := json.Marshal(registerRequest{
@@ -230,9 +292,12 @@ func (c *Client) ensure(ctx context.Context, publicOrigin string) (*registration
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		var buf [512]byte
-		n, _ := resp.Body.Read(buf[:])
-		return nil, fmt.Errorf("registrar returned %d: %s", resp.StatusCode, strings.TrimSpace(string(buf[:n])))
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		var ru registerUnavailable
+		if resp.StatusCode == http.StatusServiceUnavailable && json.Unmarshal(raw, &ru) == nil && ru.Error == "login_unavailable" {
+			c.setupURL = validSetupURL(ru.SetupURL)
+		}
+		return nil, fmt.Errorf("registrar returned %d: %s", resp.StatusCode, strings.TrimSpace(string(raw[:min(len(raw), 512)])))
 	}
 
 	var rr registerResponse
@@ -274,7 +339,7 @@ func (c *Client) ensure(ctx context.Context, publicOrigin string) (*registration
 	}
 	_ = provider.Claims(&meta)
 
-	c.reg = &registration{
+	reg := &registration{
 		clientID:     rr.ClientID,
 		clientSecret: rr.ClientSecret,
 		issuer:       rr.IssuerURL,
@@ -289,7 +354,87 @@ func (c *Client) ensure(ctx context.Context, publicOrigin string) (*registration
 		via = rr.InternalIssuerURL
 	}
 	log.Printf("[oidc] registered with %s as client %s (issuer %s, back-channel via %s)", c.cfg.RegistrarURL, rr.ClientID, rr.IssuerURL, via)
-	return c.reg, nil
+	return reg, nil
+}
+
+// validSetupURL keeps a registrar-supplied setup link only when it is an
+// absolute http(s) URL; anything else is dropped rather than put in a page.
+func validSetupURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return ""
+	}
+	return u.String()
+}
+
+// opAlive reports whether the OP answers its discovery document over the
+// back-channel. A registration outlives the OP it was made with: a gate that
+// registered while the OP was up would otherwise keep sending browsers to an
+// authorization endpoint nothing serves — a proxy 502 the gate never sees.
+func (c *Client) opAlive(ctx context.Context, reg *registration) bool {
+	c.probeMu.Lock()
+	fresh := c.probed == reg && c.now().Sub(c.probedAt) < probeTTL
+	c.probeMu.Unlock()
+	if fresh {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(reg.issuer, "/")+"/.well-known/openid-configuration", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := reg.http.Do(req)
+	if err != nil {
+		log.Printf("[oidc] the OP is not answering: %v", err)
+		return false
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[oidc] the OP is not answering: discovery returned %d", resp.StatusCode)
+		return false
+	}
+
+	c.probeMu.Lock()
+	c.probed, c.probedAt = reg, c.now()
+	c.probeMu.Unlock()
+	return true
+}
+
+// forget drops a registration whose OP stopped answering, so the next login
+// registers and discovers afresh — the OP may come back with new state, and
+// the registrar may now have a setup link to give. The registrar is idempotent,
+// so this costs one extra /register.
+func (c *Client) forget(reg *registration) {
+	c.regMu.Lock()
+	defer c.regMu.Unlock()
+	if c.reg == reg {
+		c.reg = nil
+		c.lastFailure, c.lastErr = c.now(), errors.New("the OP stopped answering")
+	}
+}
+
+// unavailable renders the sign-in-unavailable page. retry is where its refresh
+// goes; empty means this request again, which for /nhl-auth/oidc/login is the
+// login itself. Never says why: upstream errors stay in the log.
+func (c *Client) unavailable(w http.ResponseWriter, r *http.Request, retry string) {
+	if retry == "" {
+		retry = r.URL.RequestURI()
+	}
+	c.regMu.Lock()
+	setup := c.setupURL
+	c.regMu.Unlock()
+
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Cache-Control", "no-store")
+	h.Set("Retry-After", fmt.Sprint(retryAfterSeconds))
+	w.WriteHeader(http.StatusServiceUnavailable)
+	if err := unavailablePage.Execute(w, struct{ SetupURL, RetryURL string }{setup, retry}); err != nil {
+		log.Printf("[oidc] rendering the unavailable page: %v", err)
+	}
 }
 
 // guessRedirectURIs is our own guess at the host set, sent alongside
@@ -370,8 +515,12 @@ func (c *Client) handleLogin(w http.ResponseWriter, r *http.Request) {
 	reg, err := c.ensure(r.Context(), authn.PublicOrigin(r))
 	if err != nil {
 		log.Printf("[oidc] registration failed: %v", err)
-		// Never echo the upstream error to the browser.
-		http.Error(w, "Single sign-on is temporarily unavailable", http.StatusBadGateway)
+		c.unavailable(w, r, "")
+		return
+	}
+	if !c.opAlive(r.Context(), reg) {
+		c.forget(reg)
+		c.unavailable(w, r, "")
 		return
 	}
 
@@ -396,13 +545,16 @@ func (c *Client) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *Client) handleCallback(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
 	reg, err := c.ensure(r.Context(), authn.PublicOrigin(r))
 	if err != nil {
-		http.Error(w, "Single sign-on is temporarily unavailable", http.StatusBadGateway)
+		log.Printf("[oidc] registration failed: %v", err)
+		// The flow is left in place: refreshing back to the app restarts the
+		// login, while refreshing this callback would only find it used.
+		c.unavailable(w, r, c.flowTarget(q.Get("state")))
 		return
 	}
 
-	q := r.URL.Query()
 	if errCode := q.Get("error"); errCode != "" {
 		log.Printf("[oidc] provider returned error %q", errCode)
 		http.Error(w, "Sign-in was not completed", http.StatusBadRequest)
@@ -424,19 +576,19 @@ func (c *Client) handleCallback(w http.ResponseWriter, r *http.Request) {
 	tok, err := c.oauth2Config(reg, r).Exchange(oidc.ClientContext(r.Context(), reg.http), q.Get("code"), oauth2.VerifierOption(f.verifier))
 	if err != nil {
 		log.Printf("[oidc] code exchange failed: %v", err)
-		http.Error(w, "Sign-in failed", http.StatusBadGateway)
+		c.unavailable(w, r, flowRetry(f))
 		return
 	}
 	rawID, _ := tok.Extra("id_token").(string)
 	if rawID == "" {
 		log.Print("[oidc] token response contained no id_token")
-		http.Error(w, "Sign-in failed", http.StatusBadGateway)
+		c.unavailable(w, r, flowRetry(f))
 		return
 	}
 	idToken, err := reg.verifier.Verify(r.Context(), rawID)
 	if err != nil {
 		log.Printf("[oidc] id_token verification failed: %v", err)
-		http.Error(w, "Sign-in failed", http.StatusBadGateway)
+		c.unavailable(w, r, flowRetry(f))
 		return
 	}
 
@@ -527,6 +679,22 @@ func (c *Client) groupsAllowed(groups []string) bool {
 	return false
 }
 
+// flowTarget is where an in-flight login was headed, without consuming it.
+func (c *Client) flowTarget(state string) string {
+	c.flowsMu.Lock()
+	defer c.flowsMu.Unlock()
+	return flowRetry(c.flows[state])
+}
+
+// flowRetry is where the unavailable page sends a callback that failed: back to
+// the page the login started from, which challenges again. "/" when unknown.
+func flowRetry(f *flow) string {
+	if f == nil || f.originalURI == "" {
+		return "/"
+	}
+	return f.originalURI
+}
+
 // sweepFlowsLocked drops abandoned logins. Callers hold flowsMu.
 func (c *Client) sweepFlowsLocked() {
 	cutoff := c.now().Add(-flowTTL)
@@ -554,6 +722,12 @@ func (c *Client) EndSessionURL(r *http.Request, sess *session.Session) string {
 	c.regMu.Unlock()
 
 	if reg == nil || reg.endSession == "" || sess == nil || sess.IDToken == "" {
+		return ""
+	}
+	// An OP that is not answering cannot end its session either, and sending
+	// the browser there lands it on a proxy error after the gate session is
+	// already gone. The local "Signed out" page is the honest answer.
+	if !c.opAlive(r.Context(), reg) {
 		return ""
 	}
 	u, err := url.Parse(reg.endSession)

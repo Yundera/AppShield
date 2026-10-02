@@ -319,7 +319,8 @@ finishes on its own "logged out" page: one extra click and no return to the app,
 session really ends. The gate logs `logout without id_token_hint` when this happens.
 
 Either way this is **best effort**. No OIDC session, no discovered client, an OP without a
-logout endpoint, or a failure reaching it all fall through to the terminal page — failing
+logout endpoint, or an OP that does not answer its discovery document right now all fall
+through to the terminal page — failing
 to reach the OP must never trap a user inside an app whose session was already destroyed.
 
 Upstream is **not** propagated: signing out here does not sign you out of the IdP *behind*
@@ -568,7 +569,7 @@ The registrar does. AppShield sends only its callback *path* and uses the `redir
 
 This matters because the host set is a property of the deployment, not of the app. `REDIRECT_HOST_SUFFIXES` lets the sidecar guess `<app>-<suffix>`, but the PCS **root domain** breaks that rule: whichever app the root domain proxies to is also served at the bare suffix (`example.com`, not just `myapp-example.com`), and nothing an app knows about itself reveals that. An app computing its own list therefore has no registrable callback on the bare domain, so a login starting there gets bounced to `myapp-example.com` mid-flow — which users report as "SSO sent me to a different URL". Letting the registrar answer fixes it for every app at once, including store apps whose compose nobody templates.
 
-`REDIRECT_HOST_SUFFIXES` is still honoured as the pre-registration guess, as the fallback when `/register` is unreachable, and as what gets sent to registrars older than mesh-auth 1.2.0 (which require `redirect_uris` and ignore `callback_path`). Both fields are sent, so the sidecar works against either.
+`REDIRECT_HOST_SUFFIXES` is still honoured as the pre-registration guess and as what gets sent to registrars older than mesh-auth 1.2.0 (which require `redirect_uris` and ignore `callback_path`). Both fields are sent, so the sidecar works against either.
 
 Two things stay locally computed on purpose:
 
@@ -587,9 +588,19 @@ There is nothing to configure on the gate. No field ⇒ today's behaviour. The s
 [oidc] registered with http://auth-registrar:9092 as client myapp (issuer https://auth-alice.example.com, back-channel via http://dex:5556)
 ```
 
-An internal address that does not answer fails the login (502, retried on the next attempt) rather than falling back to the public path — a silent detour would hide exactly the problem this removes.
+An internal address that does not answer fails the login (the sign-in-unavailable page below, retried) rather than falling back to the public path — a silent detour would hide exactly the problem this removes.
 
 This replaces the deployment-side workaround of pinning the issuer hostname with `extra_hosts` and adding the proxy's CA through `SSL_CERT_DIR`: a gate on an `internal_issuer_url` needs neither, nor the CA mount.
+
+### When sign-in is unavailable
+
+A deployment may run no OP at all for a while — a freshly installed box nobody has claimed yet has no login method, and Dex refuses to start without one. So "the OP is not there" is a state the gate expects, not only an outage, and it never answers it with a bare 502.
+
+Whenever sign-in cannot proceed — the registrar is unreachable or refuses, discovery fails, the OP stops answering after registration, or the code exchange fails — the gate serves its own page: `503` with `Retry-After: 15`, refreshing itself every 15 seconds. A login retries itself; a failed callback refreshes back to the page the login started from, since its own state is already spent. Upstream errors stay in the log.
+
+- **The registrar can say where to finish setup.** When it cannot reach the OP it answers `503 {"error":"login_unavailable","setup_url":"…"}` (mesh-auth `SETUP_URL`; the field is optional). With a `setup_url` the page reads "This box isn't set up yet" and links to it; without one it reads "Sign-in is starting up". The link is used only if it is an absolute `http(s)` URL with no credentials in it.
+- **A registration does not outlive its OP.** Before sending a browser to the authorization endpoint the gate fetches the discovery document over the back-channel (2s timeout; a success vouches for 5s). If that fails it shows the page and forgets the registration, so the next login registers and discovers afresh once the OP is back — the registrar is idempotent, so that costs one `/register`.
+- **Failures are remembered for 5 seconds.** Inside that window a login gets the page without contacting the registrar again, so an outage does not turn every page load into a `/register` and a discovery request. After it, the next login retries.
 
 ## How It Works
 

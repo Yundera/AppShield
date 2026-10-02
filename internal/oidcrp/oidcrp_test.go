@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +23,26 @@ const (
 
 func now() time.Time { return time.UnixMilli(testNowMS) }
 
+// testClock is a clock a test can move, for the backoff and probe windows.
+type testClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newTestClock() *testClock { return &testClock{t: now()} }
+
+func (k *testClock) Now() time.Time {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.t
+}
+
+func (k *testClock) Advance(d time.Duration) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.t = k.t.Add(d)
+}
+
 // fakeOP is a minimal OpenID Provider: discovery, JWKS and a token endpoint
 // that mints ID tokens we control.
 type fakeOP struct {
@@ -30,8 +51,11 @@ type fakeOP struct {
 	// public, when set, is the issuer the OP claims to be — in discovery and in
 	// every token — while actually listening on URL. That is a deployment where
 	// the issuer's public hostname and its on-box address differ.
-	public    string
-	idClaims  map[string]any // claims to put in the next id_token
+	public   string
+	idClaims map[string]any // claims to put in the next id_token
+	// down makes every endpoint answer 503, as the proxy in front of an OP
+	// that is not running does.
+	down      atomic.Bool
 	sawPKCE   atomic.Bool
 	tokenHits atomic.Int32
 }
@@ -93,7 +117,13 @@ func newFakeOP(t *testing.T) *fakeOP {
 		})
 	})
 
-	op.Server = httptest.NewServer(mux)
+	op.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if op.down.Load() {
+			http.Error(w, "no healthy upstream", http.StatusServiceUnavailable)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}))
 	t.Cleanup(op.Close)
 	return op
 }
@@ -138,6 +168,9 @@ type fakeRegistrar struct {
 	calls    atomic.Int32
 	failNext atomic.Bool
 	respond  func() map[string]any
+	// unavailable, when set, is the body of the 503 the registrar answers
+	// while it cannot reach the OP.
+	unavailable atomic.Pointer[map[string]any]
 }
 
 func newFakeRegistrar(t *testing.T, op *fakeOP) *fakeRegistrar {
@@ -158,6 +191,12 @@ func newFakeRegistrar(t *testing.T, op *fakeOP) *fakeRegistrar {
 		reg.calls.Add(1)
 		if reg.failNext.CompareAndSwap(true, false) {
 			http.Error(w, "registrar is down", http.StatusInternalServerError)
+			return
+		}
+		if body := reg.unavailable.Load(); body != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(*body)
 			return
 		}
 		writeJSON(w, reg.respond())
@@ -254,24 +293,27 @@ func TestRegistrationHappensOnceAndIsShared(t *testing.T) {
 	}
 }
 
-// A failed registration must not be cached, or one blip poisons every later
-// login for the life of the process.
+// A failed registration must not be cached beyond the backoff window, or one
+// blip poisons every later login for the life of the process.
 func TestFailedRegistrationIsRetried(t *testing.T) {
 	op := newFakeOP(t)
 	reg := newFakeRegistrar(t, op)
 	reg.failNext.Store(true)
-	_, _, mux := newClient(t, reg, nil)
+	c, _, mux := newClient(t, reg, nil)
+	clk := newTestClock()
+	c.now = clk.Now
 
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 	// The upstream error text must not reach the browser.
 	if strings.Contains(rec.Body.String(), "registrar is down") {
 		t.Error("the upstream error was echoed to the client")
 	}
 
+	clk.Advance(failureBackoff)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
 	if rec.Code != http.StatusFound {
@@ -363,15 +405,18 @@ func TestUnusableInternalIssuerFailsInsteadOfFallingBack(t *testing.T) {
 			"internal_issuer_url": internal,
 		}
 	}
-	_, _, mux := newClient(t, reg, nil)
+	c, _, mux := newClient(t, reg, nil)
+	clk := newTestClock()
+	c.now = clk.Now
 
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 
 	internal = op.URL
+	clk.Advance(failureBackoff)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
 	if rec.Code != http.StatusFound {
@@ -972,5 +1017,198 @@ func TestPre120RegistrarKeepsLocalHostSet(t *testing.T) {
 	// The locally computed host set must survive, so redirect_uri stays stable.
 	if got := c.chosenOrigin(request("GET", "/")); got != "https://beacon-example.com" {
 		t.Errorf("chosenOrigin = %q, want the configured canonical origin", got)
+	}
+}
+
+// --- sign-in unavailable -------------------------------------------------
+
+func assertUnavailablePage(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "15" {
+		t.Errorf("Retry-After = %q, want 15", got)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Errorf("Content-Type = %q, want an HTML page", got)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `http-equiv="refresh" content="15`) {
+		t.Error("the page does not refresh itself")
+	}
+	return body
+}
+
+// A box with no login method yet: the registrar cannot reach the OP and says
+// where setup is finished. The user gets that link, not a 502.
+func TestRegistrarLoginUnavailableShowsTheSetupLink(t *testing.T) {
+	op := newFakeOP(t)
+	reg := newFakeRegistrar(t, op)
+	reg.unavailable.Store(&map[string]any{"error": "login_unavailable", "setup_url": "https://admin-example.com/"})
+	_, _, mux := newClient(t, reg, nil)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
+	body := assertUnavailablePage(t, rec)
+	if !strings.Contains(body, `href="https://admin-example.com/"`) || !strings.Contains(body, "Finish setup") {
+		t.Errorf("the page does not link to the setup URL:\n%s", body)
+	}
+}
+
+func TestUnavailableWithoutSetupURLSaysStartingUp(t *testing.T) {
+	op := newFakeOP(t)
+	reg := newFakeRegistrar(t, op)
+	reg.unavailable.Store(&map[string]any{"error": "login_unavailable"})
+	_, _, mux := newClient(t, reg, nil)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
+	body := assertUnavailablePage(t, rec)
+	if strings.Contains(body, "Finish setup") || !strings.Contains(body, "starting up") {
+		t.Errorf("want the starting-up page:\n%s", body)
+	}
+}
+
+// The setup link comes from the network, so it is checked and escaped before
+// it reaches a page.
+func TestSetupURLIsValidatedAndEscaped(t *testing.T) {
+	for _, raw := range []string{
+		"javascript:alert(1)",
+		"/relative/path",
+		"https://user:pw@admin-example.com/",
+		`https://admin-example.com/"><script>alert(1)</script>`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			op := newFakeOP(t)
+			reg := newFakeRegistrar(t, op)
+			reg.unavailable.Store(&map[string]any{"error": "login_unavailable", "setup_url": raw})
+			_, _, mux := newClient(t, reg, nil)
+
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
+			body := assertUnavailablePage(t, rec)
+			for _, bad := range []string{"javascript:", "<script>", "user:pw", `href="/relative`} {
+				if strings.Contains(body, bad) {
+					t.Errorf("the page contains %q:\n%s", bad, body)
+				}
+			}
+		})
+	}
+}
+
+// During an outage every page load would otherwise cost a /register.
+func TestFailedRegistrationBacksOff(t *testing.T) {
+	op := newFakeOP(t)
+	reg := newFakeRegistrar(t, op)
+	reg.unavailable.Store(&map[string]any{"error": "login_unavailable"})
+	c, _, mux := newClient(t, reg, nil)
+	clk := newTestClock()
+	c.now = clk.Now
+
+	for i := 0; i < 3; i++ {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
+		assertUnavailablePage(t, rec)
+	}
+	if n := reg.calls.Load(); n != 1 {
+		t.Errorf("registrar was called %d times inside the backoff window, want 1", n)
+	}
+
+	reg.unavailable.Store(nil)
+	clk.Advance(failureBackoff)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
+	if rec.Code != http.StatusFound {
+		t.Errorf("status after the backoff = %d, want 302", rec.Code)
+	}
+	if n := reg.calls.Load(); n != 2 {
+		t.Errorf("registrar was called %d times, want 2", n)
+	}
+}
+
+// A gate that registered while the OP was up must not go on sending browsers
+// to an OP that has since stopped: it shows the page, forgets the registration,
+// and registers afresh once the OP is back.
+func TestOPDownAfterRegistrationShowsThePageAndReRegisters(t *testing.T) {
+	op := newFakeOP(t)
+	reg := newFakeRegistrar(t, op)
+	c, _, mux := newClient(t, reg, nil)
+	clk := newTestClock()
+	c.now = clk.Now
+	startLogin(t, mux, "")
+
+	op.down.Store(true)
+	clk.Advance(probeTTL)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
+	assertUnavailablePage(t, rec)
+	c.regMu.Lock()
+	cleared := c.reg == nil
+	c.regMu.Unlock()
+	if !cleared {
+		t.Error("the registration of an OP that stopped answering was kept")
+	}
+
+	op.down.Store(false)
+	clk.Advance(failureBackoff)
+	startLogin(t, mux, "")
+	if n := reg.calls.Load(); n != 2 {
+		t.Errorf("registrar was called %d times, want 2 — no re-registration after recovery", n)
+	}
+}
+
+// A successful probe vouches for the OP briefly, so a burst of logins is one
+// probe, not one each.
+func TestLivenessProbeIsCachedBriefly(t *testing.T) {
+	op := newFakeOP(t)
+	reg := newFakeRegistrar(t, op)
+	c, _, mux := newClient(t, reg, nil)
+	clk := newTestClock()
+	c.now = clk.Now
+	startLogin(t, mux, "")
+
+	op.down.Store(true)
+	// Still inside probeTTL: the cached probe stands.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, request("GET", "/nhl-auth/oidc/login"))
+	if rec.Code != http.StatusFound {
+		t.Errorf("status = %d, want 302 from the cached probe", rec.Code)
+	}
+}
+
+// A callback that fails sends its refresh back to where the login started —
+// refreshing the callback itself would only find its state used.
+func TestCallbackFailureRefreshesToTheOriginalTarget(t *testing.T) {
+	op := newFakeOP(t)
+	reg := newFakeRegistrar(t, op)
+	_, _, mux := newClient(t, reg, nil)
+
+	state := startLogin(t, mux, "/dash")
+	op.down.Store(true)
+	rec := callback(t, mux, state)
+	body := assertUnavailablePage(t, rec)
+	if !strings.Contains(body, `content="15; url=/dash"`) {
+		t.Errorf("the refresh does not return to /dash:\n%s", body)
+	}
+}
+
+// Logging out against an OP that is not answering ends on the gate's own
+// "Signed out" page rather than on a proxy error.
+func TestEndSessionURLEmptyWhenTheOPIsDown(t *testing.T) {
+	op := newFakeOP(t)
+	reg := newFakeRegistrar(t, op)
+	c, store, mux := newClient(t, reg, nil)
+	clk := newTestClock()
+	c.now = clk.Now
+
+	state := startLogin(t, mux, "")
+	rec := callback(t, mux, state)
+	sess, _ := store.Get(rec.Result().Cookies()[0].Value)
+
+	op.down.Store(true)
+	clk.Advance(probeTTL)
+	if got := c.EndSessionURL(request("GET", "/nhl-auth/logout"), sess); got != "" {
+		t.Errorf("EndSessionURL = %q, want empty while the OP is down", got)
 	}
 }
